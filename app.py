@@ -1,5 +1,7 @@
 import os
 import re
+import base64
+import html
 from datetime import datetime
 
 import pandas as pd
@@ -43,11 +45,337 @@ client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
+# 图片文字识别 OCR 配置：使用阿里云百炼 DashScope 的 OpenAI 兼容接口
+DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY")
+QWEN_OCR_MODEL = get_secret_or_env("QWEN_OCR_MODEL", "qwen-vl-ocr")
+
+ocr_client = None
+if DASHSCOPE_API_KEY:
+    ocr_client = OpenAI(
+        api_key=DASHSCOPE_API_KEY,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+
 st.set_page_config(
-    page_title="图形化编程学习支持智能体",
+    page_title="图形化编程学习助手",
     page_icon="🐱",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
+
+
+# =========================
+# 1.5 页面样式
+# =========================
+
+def inject_custom_css():
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background:
+                radial-gradient(circle at 14% 12%, rgba(255, 210, 117, 0.18) 0, rgba(255, 210, 117, 0) 26%),
+                radial-gradient(circle at 86% 8%, rgba(112, 169, 255, 0.16) 0, rgba(112, 169, 255, 0) 28%),
+                linear-gradient(180deg, #F7FBFF 0%, #EEF6FF 48%, #F8FBFF 100%);
+        }
+
+        .block-container {
+            max-width: 1240px;
+            padding-top: 2.6rem;
+            padding-bottom: 6rem;
+        }
+
+        section[data-testid="stSidebar"] {
+            background: #FFFFFF;
+            border-right: 1px solid #E6EDF5;
+        }
+
+        button[data-testid="stSidebarCollapseButton"],
+        div[data-testid="stSidebarCollapseButton"] {
+            display: none !important;
+        }
+
+        #MainMenu, footer {
+            visibility: hidden;
+        }
+
+        .main-card {
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid #E3ECF6;
+            border-radius: 20px;
+            padding: 17px 22px;
+            box-shadow: 0 12px 28px rgba(52, 86, 130, 0.08);
+            margin-bottom: 16px;
+        }
+
+        .title-row {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .title-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 15px;
+            background: linear-gradient(135deg, #FFF2D6 0%, #EAF4FF 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.65rem;
+            box-shadow: inset 0 0 0 1px rgba(224, 235, 248, 0.9);
+            flex: 0 0 48px;
+        }
+
+        .title-text {
+            min-width: 0;
+        }
+
+        .app-title {
+            font-size: 1.82rem;
+            line-height: 1.16;
+            font-weight: 850;
+            color: #273247;
+            margin: 0 0 5px 0;
+            letter-spacing: -0.02em;
+        }
+
+        .app-desc {
+            font-size: 0.92rem;
+            color: #66758F;
+            margin: 0;
+        }
+
+        div[data-testid="stTextInput"] input {
+            border-radius: 14px;
+            border: none !important;
+            background: #FFFFFF;
+            height: 42px;
+            box-shadow: none !important;
+            outline: none !important;
+        }
+
+        div[data-testid="stTextInput"] [data-baseweb="input"] {
+            border-radius: 14px !important;
+            border: 1px solid #DDE8F4 !important;
+            background: #FFFFFF !important;
+            box-shadow: none !important;
+        }
+
+        div[data-testid="stTextInput"] [data-baseweb="input"]:focus-within {
+            border: 1px solid #80B7FF !important;
+            box-shadow: 0 0 0 2px rgba(128, 183, 255, 0.12) !important;
+        }
+
+        div[data-testid="stTextInput"] input:focus {
+            outline: none !important;
+            box-shadow: none !important;
+            border: none !important;
+        }
+
+        div[data-testid="stTextInput"] label {
+            color: #263449;
+            font-weight: 600;
+        }
+
+        .starter-area {
+            margin: 2px 0 14px 38px;
+            max-width: 500px;
+        }
+
+        .starter-area .stButton {
+            margin-bottom: 4px;
+        }
+
+        .starter-area .stButton > button {
+            width: fit-content;
+            max-width: 100%;
+            min-height: 28px;
+            border-radius: 12px;
+            border-top-left-radius: 5px;
+            border: 1px solid #E5EDF6;
+            background: rgba(255, 255, 255, 0.92);
+            color: #44536A;
+            padding: 0.24rem 0.50rem;
+            text-align: left;
+            font-size: 0.78rem;
+            box-shadow: 0 4px 10px rgba(52, 86, 130, 0.035);
+        }
+
+        .starter-area .stButton > button:hover {
+            border-color: #9BC7FF;
+            color: #1F5FBF;
+            background: #FFFFFF;
+            transform: translateY(-1px);
+        }
+
+        .stButton > button {
+            border-radius: 15px;
+            border: 1px solid #D8E5F4;
+            background: rgba(255,255,255,0.94);
+            color: #3E5069;
+            padding: 0.48rem 0.74rem;
+            min-height: 40px;
+            font-size: 0.88rem;
+            box-shadow: 0 7px 16px rgba(52, 86, 130, 0.055);
+            transition: all 0.16s ease-in-out;
+            text-align: left;
+        }
+
+        .stButton > button:hover {
+            border-color: #8EBEFF;
+            color: #1F5FBF;
+            background: #FFFFFF;
+            transform: translateY(-1px);
+        }
+
+        .chat-wrap {
+            display: flex;
+            width: 100%;
+            margin: 10px 0;
+            align-items: flex-start;
+            gap: 8px;
+        }
+
+        .chat-wrap.user {
+            justify-content: flex-end;
+        }
+
+        .chat-wrap.assistant {
+            justify-content: flex-start;
+        }
+
+        .chat-content {
+            min-width: 0;
+            display: flex;
+        }
+
+        .chat-wrap.user .chat-content {
+            max-width: 78%;
+            justify-content: flex-end;
+        }
+
+        .chat-wrap.assistant .chat-content {
+            max-width: 88%;
+            justify-content: flex-start;
+        }
+
+        .chat-bubble {
+            display: inline-block;
+            width: fit-content;
+            max-width: 100%;
+            padding: 10px 13px;
+            border-radius: 16px;
+            font-size: 0.95rem;
+            line-height: 1.55;
+            white-space: pre-wrap;
+            word-break: break-word;
+            box-sizing: border-box;
+            box-shadow: 0 6px 18px rgba(52, 86, 130, 0.06);
+        }
+
+        .chat-bubble.user {
+            background: #B9ECA0;
+            color: #1F2B1D;
+            border-top-right-radius: 5px;
+        }
+
+        .chat-bubble.assistant {
+            background: #FFFFFF;
+            color: #273247;
+            border: 1px solid #E5EDF6;
+            border-top-left-radius: 5px;
+        }
+
+        .chat-bubble .md-line {
+            margin: 0.24rem 0;
+        }
+
+        .chat-bubble .md-heading {
+            font-weight: 850;
+            font-size: 1.08rem;
+            color: #21304A;
+            margin: 0.72rem 0 0.36rem 0;
+        }
+
+        .chat-bubble .md-heading:first-child {
+            margin-top: 0;
+        }
+
+        .chat-bubble .md-number,
+        .chat-bubble .md-bullet {
+            margin: 0.28rem 0;
+        }
+
+        .chat-bubble .md-space {
+            height: 0.45rem;
+        }
+
+        .chat-bubble strong {
+            color: #1F2B3F;
+            font-weight: 850;
+        }
+
+        .chat-avatar {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.9rem;
+            flex: 0 0 30px;
+            margin-top: 2px;
+            box-shadow: 0 4px 12px rgba(52, 86, 130, 0.08);
+        }
+
+        .chat-avatar.user {
+            background: #DFF6D3;
+            color: #2F6B27;
+            order: 2;
+        }
+
+        .chat-avatar.assistant {
+            background: #FFFFFF;
+            color: #273247;
+            border: 1px solid #E5EDF6;
+        }
+
+        div[data-testid="stChatInput"] {
+            background: rgba(244, 248, 252, 0.88);
+        }
+
+        div[data-testid="stChatInput"] > div {
+            border: 1px solid #CFE0F5 !important;
+            box-shadow: 0 8px 22px rgba(52, 86, 130, 0.07) !important;
+        }
+
+        div[data-testid="stChatInput"]:focus-within > div {
+            border: 1px solid #80B7FF !important;
+            box-shadow: 0 0 0 2px rgba(128, 183, 255, 0.16) !important;
+        }
+
+        div[data-testid="stChatInput"] [data-baseweb="textarea"],
+        div[data-testid="stChatInput"] textarea {
+            border: none !important;
+            box-shadow: none !important;
+            outline: none !important;
+            background: transparent !important;
+        }
+
+        div[data-testid="stChatInput"] [data-baseweb="textarea"]:focus-within,
+        div[data-testid="stChatInput"] textarea:focus {
+            border: none !important;
+            box-shadow: none !important;
+            outline: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+inject_custom_css()
 
 
 # =========================
@@ -55,7 +383,7 @@ st.set_page_config(
 # =========================
 
 SYSTEM_PROMPT = """
-你是“图形化编程学习支持智能体”，服务于小学高年级 Scratch 图形化编程课堂。
+你是“图形化编程学习助手”，服务于小学高年级 Scratch 图形化编程课堂。
 
 你的服务对象包括教师和学生。
 
@@ -173,6 +501,15 @@ def build_role_prompt(role: str) -> str:
 - 学生活动：
 - 智能体支持：
 - 设计意图：
+
+（三）教学反思
+
+教学反思必须作为教学设计结尾，简要包括以下内容：
+
+1. 目标达成反思：说明本节课教学目标是否基本达成。
+2. 学生学习反思：说明学生在任务理解、程序搭建、调试修改中的表现。
+3. 智能体使用反思：说明智能体在哪些环节提供了支持，是否存在使用不足。
+4. 改进建议：提出后续教学中可以优化的地方。
 
 三、关于“智能体支持”的要求
 
@@ -366,6 +703,197 @@ def clean_answer(text: str) -> str:
     return text.strip()
 
 
+def normalize_student_numbering(text: str) -> str:
+    """
+    只用于学生端：把常见的 1.、（1）、(1) 等编号统一成 ①②③。
+    教师端不使用，避免影响教案中的正式层级编号。
+    """
+    if not text:
+        return ""
+
+    number_map = [
+        ("10", "⑩"),
+        ("1", "①"),
+        ("2", "②"),
+        ("3", "③"),
+        ("4", "④"),
+        ("5", "⑤"),
+        ("6", "⑥"),
+        ("7", "⑦"),
+        ("8", "⑧"),
+        ("9", "⑨"),
+    ]
+
+    for num, circled in number_map:
+        text = text.replace(f"（{num}）", circled)
+        text = text.replace(f"({num})", circled)
+
+    converted_lines = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        prefix = line[:len(line) - len(stripped)]
+        new_line = line
+
+        for num, circled in number_map:
+            for mark in [".", "．", "、"]:
+                marker = f"{num}{mark}"
+                if stripped.startswith(marker):
+                    new_line = prefix + circled + " " + stripped[len(marker):].lstrip()
+                    break
+            if new_line != line:
+                break
+
+        converted_lines.append(new_line)
+
+    return chr(10).join(converted_lines)
+
+
+def apply_simple_bold(text: str) -> str:
+    parts = text.split("**")
+    if len(parts) < 3:
+        return text
+
+    result = []
+    for index, part in enumerate(parts):
+        if index % 2 == 1:
+            result.append("<strong>" + part + "</strong>")
+        else:
+            result.append(part)
+
+    return "".join(result)
+
+
+def format_message_content(content: str) -> str:
+    """
+    将模型文本转换成更适合气泡显示的 HTML。
+    主要处理教师端中常见的标题、加粗、分点和空行，让教学设计排版更整齐。
+    """
+    escaped = html.escape(content or "")
+    escaped = apply_simple_bold(escaped)
+
+    circled_numbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"]
+    parts = []
+
+    for line in escaped.splitlines():
+        stripped = line.strip()
+
+        if not stripped:
+            parts.append('<div class="md-space"></div>')
+            continue
+
+        if stripped.startswith("#"):
+            heading_text = stripped.lstrip("#").strip()
+            if heading_text:
+                parts.append('<div class="md-heading">' + heading_text + '</div>')
+                continue
+
+        if stripped.startswith("- "):
+            parts.append('<div class="md-bullet">• ' + stripped[2:].strip() + '</div>')
+            continue
+
+        if stripped.startswith("• "):
+            parts.append('<div class="md-bullet">' + stripped + '</div>')
+            continue
+
+        is_number_line = False
+        for number_text in circled_numbers:
+            if stripped.startswith(number_text):
+                is_number_line = True
+                break
+
+        for number in range(1, 21):
+            if stripped.startswith(str(number) + ".") or stripped.startswith(str(number) + "．") or stripped.startswith(str(number) + "、"):
+                is_number_line = True
+                break
+
+        if stripped.startswith("（") or stripped.startswith("("):
+            is_number_line = True
+
+        if is_number_line:
+            parts.append('<div class="md-number">' + stripped + '</div>')
+        else:
+            parts.append('<div class="md-line">' + stripped + '</div>')
+
+    return "".join(parts)
+
+
+def render_chat_bubble(role: str, content: str):
+    """
+    使用自定义 HTML 渲染类似微信的左右聊天气泡。
+    用户问题显示在右侧，智能体回答显示在左侧。
+    """
+    safe_content = format_message_content(content or "")
+    if role == "user":
+        bubble_role = "user"
+        avatar = "我"
+    else:
+        bubble_role = "assistant"
+        avatar = "🐱"
+
+    st.markdown(
+        f"""
+        <div class="chat-wrap {bubble_role}">
+            <div class="chat-avatar {bubble_role}">{avatar}</div>
+            <div class="chat-content">
+                <div class="chat-bubble {bubble_role}">{safe_content}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# =========================
+# 4.5 图片文字识别 OCR
+# =========================
+
+def image_file_to_data_url(uploaded_file):
+    """
+    把上传的图片转换为 base64 格式，供 OCR 模型读取。
+    """
+    uploaded_file.seek(0)
+    mime_type = uploaded_file.type or "image/png"
+    image_bytes = uploaded_file.getvalue()
+    encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded_image}"
+
+
+def recognize_image_text(uploaded_file):
+    """
+    使用 Qwen-OCR 识别图片中的文字。
+    """
+    if ocr_client is None:
+        return "图片文字识别功能还没有配置 DASHSCOPE_API_KEY，请先在 Streamlit Secrets 中添加 DASHSCOPE_API_KEY。"
+
+    image_url = image_file_to_data_url(uploaded_file)
+
+    response = ocr_client.chat.completions.create(
+        model=QWEN_OCR_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "请提取这张图片中的全部可见文字。尽量保持原有顺序。不要解释，不要扩展，只输出识别到的文字。"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url
+                        }
+                    }
+                ]
+            }
+        ],
+        temperature=0,
+        max_tokens=1500
+    )
+
+    raw_text = response.choices[0].message.content
+    return clean_answer(raw_text)
+
+
 # =========================
 # 5. 调用 DeepSeek
 # =========================
@@ -393,7 +921,37 @@ def call_deepseek(role: str, messages: list) -> str:
     )
 
     raw_answer = response.choices[0].message.content
-    return clean_answer(raw_answer)
+    answer = clean_answer(raw_answer)
+
+    if role == "学生端":
+        answer = normalize_student_numbering(answer)
+
+    return answer
+
+
+# =========================
+# 5.5 开场白问题
+# =========================
+
+def get_starter_questions(role: str):
+    if role == "教师端":
+        return [
+            ("教学设计", "请帮我设计一节《打地鼠》Scratch图形化编程教学设计。"),
+            ("任务单", "请帮我生成一份适合五年级学生的Scratch任务单。"),
+            ("问题链", "请帮我设计一组课堂问题链。"),
+            ("调试支持", "请帮我整理学生常见的Scratch调试问题。")
+        ]
+
+    return [
+        ("任务分析", "我想做一个打地鼠小游戏，应该先分析哪些内容？"),
+        ("调试帮助", "我的角色只动了一次，应该先检查哪里？"),
+        ("变量问题", "我想让分数增加，但分数没有变化，可以怎么排查？"),
+        ("图片识别", "我上传了一张程序截图，请帮我识别里面的文字并给我提示。")
+    ]
+
+
+def set_quick_prompt(prompt_text: str):
+    st.session_state.quick_prompt = prompt_text
 
 
 # =========================
@@ -406,6 +964,7 @@ user_role = st.sidebar.radio(
     "请选择使用入口",
     ["学生端", "教师端"]
 )
+
 
 TEACHER_PASSWORD = get_secret_or_env("TEACHER_PASSWORD", "teacher123")
 
@@ -423,6 +982,7 @@ if "current_role" not in st.session_state:
 if st.session_state.current_role != user_role:
     st.session_state.current_role = user_role
     st.session_state.messages = []
+    st.session_state.quick_prompt = ""
 
 
 # 初始化聊天记录
@@ -435,11 +995,29 @@ if "student_session_id" not in st.session_state:
     st.session_state.student_session_id = ""
 
 
+# 初始化快捷问题
+if "quick_prompt" not in st.session_state:
+    st.session_state.quick_prompt = ""
+
+
 # =========================
 # 7. 页面主体
 # =========================
 
-st.title("🐱 图形化编程学习支持智能体")
+st.markdown(
+    """
+    <div class="main-card">
+        <div class="title-row">
+            <div class="title-icon">🐱</div>
+            <div class="title-text">
+                <div class="app-title">图形化编程学习助手</div>
+                <p class="app-desc">提问时说清楚：想实现什么、做到了哪一步、遇到了什么问题。</p>
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 if user_role == "学生端":
     col1, col2, col3 = st.columns([1, 1, 1])
@@ -453,8 +1031,6 @@ if user_role == "学生端":
     with col3:
         topic = st.text_input("当前主题", placeholder="如：打地鼠")
 
-    st.caption("提问时请尽量说清楚：想实现什么、已经做了什么、现在出现什么问题。")
-
     # 只根据“小组号 + 当前主题”判断是否开启新对话
     # 只有小组号和当前主题都填写后，才进行判断
     # 小组号或当前主题任意一个发生变化，就清空当前页面对话
@@ -465,13 +1041,37 @@ if user_role == "学生端":
         if current_student_session != st.session_state.student_session_id:
             st.session_state.student_session_id = current_student_session
             st.session_state.messages = []
+            st.session_state.quick_prompt = ""
             st.rerun()
 
 else:
     student_name = ""
     group_no = ""
     topic = ""
-    st.caption("教师端可用于教学设计、任务单、课堂问题链、调试提示、展示评价和教学反思。")
+
+
+# =========================
+# 7.5 开场白问题区域
+# =========================
+
+if not st.session_state.messages:
+    render_chat_bubble(
+        "assistant",
+        "你好，我可以帮你分析 Scratch 任务、检查程序问题，也可以识别你上传的程序截图。你可以直接提问，也可以从下面选一个问题开始。"
+    )
+
+    st.markdown('<div class="starter-area">', unsafe_allow_html=True)
+    starter_questions = get_starter_questions(user_role)
+
+    for i, item in enumerate(starter_questions):
+        label, question = item
+        st.button(
+            question,
+            key=f"starter_{user_role}_{i}",
+            on_click=set_quick_prompt,
+            args=(question,)
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # =========================
@@ -479,61 +1079,109 @@ else:
 # =========================
 
 for msg in st.session_state.messages:
-    if msg["role"] == "user":
-        with st.chat_message("user", avatar="👤"):
-            st.markdown(msg["content"])
-    else:
-        with st.chat_message("assistant", avatar="🐱"):
-            st.markdown(msg["content"])
+    render_chat_bubble(msg["role"], msg["content"])
 
 
 # =========================
-# 9. 聊天输入框
+# 9. 聊天输入框：支持文字 + 图片附件
 # =========================
 
 if user_role == "学生端":
-    input_placeholder = "请输入你的问题，例如：我想让地鼠被点击后加分，但是分数没有变化。"
+    input_placeholder = "请输入问题，或点击附件上传图片。"
 else:
-    input_placeholder = "请输入你的教学需求，例如：请帮我设计一节《打地鼠》教学设计。"
+    input_placeholder = "请输入教学需求，或点击附件上传图片。"
 
-user_input = st.chat_input(input_placeholder)
+prompt = st.chat_input(
+    input_placeholder,
+    accept_file=True,
+    file_type=["png", "jpg", "jpeg"]
+)
 
-if user_input:
+if prompt:
+    # 新版 st.chat_input 在 accept_file=True 时返回类似对象，包含 text 和 files
+    user_input = getattr(prompt, "text", "") or ""
+    uploaded_image = prompt.files[0] if getattr(prompt, "files", None) else None
+elif st.session_state.quick_prompt:
+    user_input = st.session_state.quick_prompt
+    uploaded_image = None
+    st.session_state.quick_prompt = ""
+else:
+    user_input = None
+    uploaded_image = None
+
+if user_input or uploaded_image is not None:
     if user_role == "学生端":
         if not student_name.strip() or not group_no.strip() or not topic.strip():
             st.warning("请先填写姓名、小组号和当前主题，再进行提问。")
             st.stop()
 
+    display_user_input = user_input if user_input else "请识别这张图片中的文字。"
+    api_user_input = user_input if user_input else "请识别这张图片中的文字，并结合小学图形化编程学习场景给出简要说明。"
+    uploaded_image_name = ""
+
+    # 如果上传了图片，先进行 OCR 文字识别
+    if uploaded_image is not None:
+        uploaded_image_name = uploaded_image.name
+
+        with st.spinner("正在识别图片中的文字，请稍等……"):
+            ocr_text = recognize_image_text(uploaded_image)
+
+        display_user_input = f"{display_user_input}\n\n（已上传图片：{uploaded_image.name}）"
+
+        api_user_input = f"""
+{api_user_input}
+
+【图片文字识别结果】
+{ocr_text}
+
+请结合上面的图片文字识别结果回答用户问题。
+
+注意：
+1. 如果识别结果足够，请结合识别出的文字进行分析。
+2. 如果识别结果不足以判断问题，请提醒用户上传更清晰的截图，或补充说明自己想实现什么、已经做了什么、出现了什么问题。
+3. 面向学生时，仍然不能直接给完整程序，只能给分步提示或检查方向。
+"""
+
+    # 页面上只显示简洁内容，不直接显示很长的 OCR 文本
     st.session_state.messages.append({
         "role": "user",
-        "content": user_input
+        "content": display_user_input
     })
 
-    with st.chat_message("user", avatar="👤"):
-        st.markdown(user_input)
+    render_chat_bubble("user", display_user_input)
 
-    with st.chat_message("assistant", avatar="🐱"):
-        with st.spinner("智能体正在思考中，请稍等……"):
-            try:
-                answer = call_deepseek(user_role, st.session_state.messages)
-                st.markdown(answer)
+    with st.spinner("智能体正在思考中，请稍等……"):
+        try:
+            messages_for_api = st.session_state.messages[:-1] + [
+                {
+                    "role": "user",
+                    "content": api_user_input
+                }
+            ]
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": answer
-                })
+            answer = call_deepseek(user_role, messages_for_api)
+            render_chat_bubble("assistant", answer)
 
-                save_log(
-                    role=user_role,
-                    user_input=user_input,
-                    answer=answer,
-                    student_name=student_name,
-                    group_no=group_no,
-                    topic=topic
-                )
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer
+            })
 
-            except Exception as e:
-                st.error(f"调用失败：{e}")
+            log_user_input = user_input if user_input else "请识别这张图片中的文字。"
+            if uploaded_image_name:
+                log_user_input = f"{log_user_input}（上传图片：{uploaded_image_name}）"
+
+            save_log(
+                role=user_role,
+                user_input=log_user_input,
+                answer=answer,
+                student_name=student_name,
+                group_no=group_no,
+                topic=topic
+            )
+
+        except Exception as e:
+            st.error(f"调用失败：{e}")
 
 
 # =========================
@@ -547,6 +1195,7 @@ if user_role == "教师端":
 
     if st.sidebar.button("清空当前对话"):
         st.session_state.messages = []
+        st.session_state.quick_prompt = ""
         st.rerun()
 
     logs = load_logs()
