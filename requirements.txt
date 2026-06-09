@@ -2,3 +2,7 @@ streamlit
 openai
 pandas
 python-dotenv
+openpyxl
+pillow
+streamlit-paste-button
+opencv-python-headless
