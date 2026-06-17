@@ -7,6 +7,7 @@ import zipfile
 import json
 import tempfile
 from datetime import datetime
+from pathlib import Path
 
 
 import pandas as pd
@@ -22,6 +23,7 @@ from PIL import Image as PILImage
 from streamlit_paste_button import paste_image_button
 from io import BytesIO
 
+APP_VERSION = "screenshot_program_block_v17_context_aware"
 
 # =========================
 # 1. 基础配置
@@ -65,6 +67,7 @@ DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY")
 QWEN_OCR_MODEL = get_secret_or_env("QWEN_OCR_MODEL", "qwen-vl-ocr")
 # 作品运行视频分析使用的 Qwen-VL 模型。可在 Secrets 中配置 QWEN_VL_MODEL。
 QWEN_VL_MODEL = get_secret_or_env("QWEN_VL_MODEL", "qwen3-vl-flash")
+# QWEN_VL_MODEL 同时用于学生截图结构分析与教师端作品运行视频分析。
 
 ocr_client = None
 if DASHSCOPE_API_KEY:
@@ -79,6 +82,309 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+
+# =========================
+# 1.2 学生端图形化编程知识库
+# =========================
+
+APP_DIR = Path(__file__).resolve().parent
+KNOWLEDGE_FILE = APP_DIR / "scratch_knowledge.xlsx"
+KNOWLEDGE_SHEET_NAME = "知识库"
+
+KNOWLEDGE_REQUIRED_COLUMNS = [
+    "知识编号",
+    "知识类别",
+    "知识点",
+    "知识类型",
+    "优先级",
+    "关键词",
+    "典型问法",
+    "核心说明",
+    "常见问题或现象",
+    "可能原因",
+    "学生端引导提示",
+    "回答边界",
+    "检索文本",
+    "启用状态",
+]
+
+
+@st.cache_data(show_spinner=False)
+def load_knowledge_base(file_path: str, modified_time: float) -> pd.DataFrame:
+    """读取固定的学生端知识库。modified_time 用于文件更新后刷新缓存。"""
+    _ = modified_time
+
+    df = pd.read_excel(
+        file_path,
+        sheet_name=KNOWLEDGE_SHEET_NAME,
+        dtype=str,
+        engine="openpyxl"
+    ).fillna("")
+
+    df.columns = [str(column).strip() for column in df.columns]
+
+    missing_columns = [
+        column
+        for column in KNOWLEDGE_REQUIRED_COLUMNS
+        if column not in df.columns
+    ]
+    if missing_columns:
+        raise ValueError("知识库缺少字段：" + "、".join(missing_columns))
+
+    for column in KNOWLEDGE_REQUIRED_COLUMNS:
+        df[column] = df[column].astype(str).str.strip()
+
+    enabled_values = {"启用", "是", "1", "true", "True", "TRUE"}
+    df = df[df["启用状态"].isin(enabled_values)].copy()
+
+    priority_map = {
+        "核心": 3,
+        "常用": 2,
+        "一般": 1,
+    }
+    df["_优先级分值"] = (
+        df["优先级"]
+        .map(priority_map)
+        .fillna(1)
+        .astype(float)
+    )
+
+    return df.reset_index(drop=True)
+
+
+def normalize_knowledge_text(text: str) -> str:
+    """清理检索文本，保留中文、字母和数字。"""
+    text = str(text or "").lower()
+    return re.sub(
+        r"[\s，。！？；：、,.!?;:（）()【】\[\]“”‘’\"'<>《》]+",
+        "",
+        text
+    )
+
+
+def split_knowledge_keywords(text: str):
+    """把关键词单元格拆分为独立关键词。"""
+    return [
+        item.strip()
+        for item in re.split(r"[,，;；、\s]+", str(text or ""))
+        if item.strip()
+    ]
+
+
+def make_character_bigrams(text: str):
+    """生成连续双字集合，适合当前小规模中文知识库的轻量检索。"""
+    normalized = normalize_knowledge_text(text)
+
+    if not normalized:
+        return set()
+
+    if len(normalized) == 1:
+        return {normalized}
+
+    return {
+        normalized[index:index + 2]
+        for index in range(len(normalized) - 1)
+    }
+
+
+def calculate_knowledge_similarity(query: str, target: str) -> float:
+    """计算两个中文短文本之间的简单相似度。"""
+    query_normalized = normalize_knowledge_text(query)
+    target_normalized = normalize_knowledge_text(target)
+
+    if not query_normalized or not target_normalized:
+        return 0.0
+
+    if min(len(query_normalized), len(target_normalized)) >= 2 and (
+        query_normalized in target_normalized
+        or target_normalized in query_normalized
+    ):
+        return 1.0
+
+    query_bigrams = make_character_bigrams(query_normalized)
+    target_bigrams = make_character_bigrams(target_normalized)
+
+    if not query_bigrams or not target_bigrams:
+        return 0.0
+
+    intersection_count = len(query_bigrams & target_bigrams)
+    return (2.0 * intersection_count) / (
+        len(query_bigrams) + len(target_bigrams)
+    )
+
+
+def retrieve_knowledge(
+    knowledge_df: pd.DataFrame,
+    student_question: str,
+    current_theme: str = "",
+    ocr_text: str = "",
+    top_k: int = 3,
+) -> pd.DataFrame:
+    """
+    检索与本轮问题最相关的知识条目。
+    当前主题只提供情境，不限制知识库范围。
+    """
+    if knowledge_df is None or knowledge_df.empty:
+        return pd.DataFrame()
+
+    query_parts = [
+        str(student_question or "").strip(),
+        str(ocr_text or "").strip()[:1800],
+    ]
+    query_text = "；".join(part for part in query_parts if part)
+
+    if not normalize_knowledge_text(query_text):
+        return pd.DataFrame()
+
+    field_weights = {
+        "知识点": 5.5,
+        "典型问法": 5.0,
+        "常见问题或现象": 4.8,
+        "可能原因": 3.0,
+        "核心说明": 2.3,
+        "学生端引导提示": 2.2,
+        "检索文本": 1.5,
+    }
+
+    normalized_query = normalize_knowledge_text(query_text)
+    theme_text = normalize_knowledge_text(current_theme)
+    scored_rows = []
+
+    for index, row in knowledge_df.iterrows():
+        score = 0.0
+        strong_match = False
+
+        for keyword in split_knowledge_keywords(row.get("关键词", "")):
+            normalized_keyword = normalize_knowledge_text(keyword)
+
+            if not normalized_keyword:
+                continue
+
+            if normalized_keyword in normalized_query:
+                score += 8.0
+                strong_match = True
+            else:
+                keyword_similarity = calculate_knowledge_similarity(
+                    query_text,
+                    keyword
+                )
+                if keyword_similarity >= 0.62:
+                    score += keyword_similarity * 3.0
+
+        for field_name, weight in field_weights.items():
+            similarity = calculate_knowledge_similarity(
+                query_text,
+                str(row.get(field_name, "") or "")
+            )
+            score += similarity * weight
+
+            if similarity >= 0.5:
+                strong_match = True
+
+        # 当前主题只提供很小的情境加成，避免把知识检索限制在某个主题。
+        if theme_text and theme_text in normalize_knowledge_text(row.get("检索文本", "")):
+            score += 0.3
+
+        # 优先级只参与相关条目之间的排序。
+        if strong_match:
+            score += float(row.get("_优先级分值", 1)) * 0.3
+
+        if strong_match and score >= 2.5:
+            scored_rows.append({
+                "index": index,
+                "score": score,
+            })
+
+    if not scored_rows:
+        return pd.DataFrame()
+
+    scored_rows = sorted(
+        scored_rows,
+        key=lambda item: item["score"],
+        reverse=True
+    )[:max(1, top_k)]
+
+    selected_indices = [item["index"] for item in scored_rows]
+    selected_df = knowledge_df.loc[selected_indices].copy()
+    selected_df["_匹配分数"] = [
+        round(item["score"], 4)
+        for item in scored_rows
+    ]
+
+    return selected_df.reset_index(drop=True)
+
+
+def build_knowledge_context(matched_df: pd.DataFrame) -> str:
+    """把检索结果整理为模型能够使用的上下文。"""
+    if matched_df is None or matched_df.empty:
+        return (
+            "本轮没有检索到高度相关的知识条目。"
+            "只能依据学生文字和截图中能够确认的信息回答；"
+            "如果无法确定，应追问一个关键问题。"
+        )
+
+    blocks = []
+
+    for _, row in matched_df.iterrows():
+        blocks.append(
+            "\n".join([
+                f"知识编号：{row.get('知识编号', '')}",
+                f"知识类别：{row.get('知识类别', '')}",
+                f"知识点：{row.get('知识点', '')}",
+                f"知识类型：{row.get('知识类型', '')}",
+                f"核心说明：{row.get('核心说明', '')}",
+                f"常见问题或现象：{row.get('常见问题或现象', '')}",
+                f"可能原因：{row.get('可能原因', '')}",
+                f"回答边界：{row.get('回答边界', '')}",
+            ])
+        )
+
+    return "\n\n---\n\n".join(blocks)
+
+
+def build_student_knowledge_prompt(
+    current_theme: str,
+    knowledge_context: str,
+) -> str:
+    """生成学生端本轮知识库约束。"""
+    return f"""
+【当前课堂主题】
+{current_theme or "未提供"}
+
+【本轮检索到的图形化编程知识】
+{knowledge_context}
+
+【知识库使用规则】
+1. 知识库用于帮助判断学生当前问题，不要逐字照抄。
+2. 当前主题只提供情境，不得把智能体回答范围限制在该主题。
+3. 本轮回答的证据优先级为：截图结构分析 > OCR文字 > 知识库 > 一般经验。不得用知识库中的常见原因覆盖截图中已经显示的事实。
+4. 在说“缺少某个积木”之前，必须先确认截图结构分析中没有该积木；如果截图中已经存在，不得再建议添加同一个积木。
+5. 截图能够明确定位时，只指出一个主要问题，并给出一个关键修改方向。
+6. 不得因为知识库列出了多个字段，就把全部原因和建议都告诉学生。
+7. 不得直接给出完整作品程序、完整积木组合或完整连接顺序。
+8. 知识库没有命中但问题可以确定时，可依据图形化编程基础知识谨慎回答。
+9. 知识库没有命中且信息不足时，只追问一个关键问题或请学生补充完整截图。
+10. 不得编造知识库内容，也不得声称答案一定正确。
+""".strip()
+
+
+KNOWLEDGE_BASE_DF = pd.DataFrame()
+KNOWLEDGE_LOAD_ERROR = ""
+
+if not KNOWLEDGE_FILE.exists():
+    KNOWLEDGE_LOAD_ERROR = (
+        "未找到 scratch_knowledge.xlsx。"
+        "请将它与当前 Python 主程序放在同一目录。"
+    )
+else:
+    try:
+        KNOWLEDGE_BASE_DF = load_knowledge_base(
+            str(KNOWLEDGE_FILE),
+            KNOWLEDGE_FILE.stat().st_mtime,
+        )
+    except Exception as exc:
+        KNOWLEDGE_LOAD_ERROR = f"知识库读取失败：{exc}"
 
 
 # =========================
@@ -384,6 +690,24 @@ def inject_custom_css():
             color: #21304A;
         }
 
+        .chat-bubble .program-block {
+            margin: 0.55rem 0;
+            border-left: 4px solid #D9DEE7;
+            background: #F7F8FA;
+            border-radius: 8px;
+            padding: 10px 12px;
+            overflow-x: auto;
+        }
+
+        .chat-bubble .program-block pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            font-size: 0.92rem;
+            line-height: 1.65;
+            color: #202939;
+        }
 
         .chat-bubble strong {
             color: #1F2B3F;
@@ -515,7 +839,7 @@ SYSTEM_PROMPT = """
 1. 教师端重在支持教学设计、课堂调控、任务单生成、问题链设计、调试提示、展示评价和教学反思。
 2. 学生端重在引导思考，不能直接替学生完成完整程序，不能直接给出完整答案。
 3. 所有回答必须围绕小学图形化编程任务展开。
-4. 面向学生时，要用短句、分步提示，每次只推进一点。
+4. 面向学生时，要使用自然、简短、适合小学五年级学生理解的语言；问题简单时直接回答，确实存在多个步骤时再分步提示。
 5. 面向教师时，要规范、清晰、可操作，贴近小学课堂实际。
 6.图形化编程教学流程为：情境创设、任务分析、实践创作、展示评价。
 7. 任务分析建议采用：作品 → 角色 → 动作、规则、效果；必要时可引导教师和学生借助思维导图、流程图或任务分析表梳理作品结构与程序逻辑。
@@ -678,8 +1002,7 @@ def build_role_prompt(role: str) -> str:
         return """
 当前用户身份：学生。
 
-你是小学图形化编程学习助手。
-
+你是小学图形化编程学习助手。你的回答应像教师在学生身边进行即时指导，既要准确，也要自然、简短，避免使用固定模板和重复句式。
 请根据学生输入，自动判断其问题属于以下哪一类：
 1. 任务理解；
 2. 任务分析；
@@ -692,76 +1015,90 @@ def build_role_prompt(role: str) -> str:
 学生端回答规则：
 
 一、基本规则
-1. 不能直接给完整程序。
-2. 不能直接给完整积木组合。
-3. 不能直接替学生完成答案。
-4. 要用短句，适合小学五年级学生理解。
-5. 如果信息不足，最多追问2个关键问题。
-6. 如果是调试问题，先给1—2个最可能的检查方向。
-7. 如果是任务分析，采用“作品 → 角色 → 动作、规则、效果”的方式引导；如果学生说“帮我画思维导图”“帮我梳理逻辑”“我不知道怎么分析作品”，应帮助学生整理文字版任务分析框架，但不能直接替学生完成全部内容。
-8. 如果是作品优化，只给1—2个可以自己尝试的建议。
-9. 要鼓励学生先尝试、运行、观察效果，再继续修改。
-10. 不使用 Markdown 表格，不得出现 <br>、<p>、<div> 等 HTML 标签。
-11. 分点提示统一使用“①②③”，不要使用“（1）（2）（3）”或“1. 2. 3.”。
-12. 不要输出空编号、空项目或占位符；如果不知道某个角色或规则，应提醒学生补充，而不是留空。
-13. 不要使用 Markdown 加粗符号，例如 **重点** 或 *内容*。
-14. 不要输出单字标题，例如“被”“隐藏”“滑行”“克隆”；小标题必须是完整表达，如“被点击后怎么办”。
-15. 如果一句话没有说完整，不要单独另起编号；宁可直接追问学生补充。
+1. 不能直接替学生完成整个作品或给出所有角色的完整程序。对于学生已经搭建并上传截图的调试问题，在准确说明原因后，可以展示“与当前错误直接相关的一段修改后程序”，帮助学生对照修改，但不得扩展为整个作品答案。
+2. 回答应使用小学五年级学生能够理解的短句，避免长篇解释和过多专业术语。
+3. 学生的问题已经明确时，直接回应核心问题，不重复复述学生的问题。
+4. 同一段连续对话中，不要每次都使用“同学你好”“我看到你的问题了”“我看到你上传的截图了”等问候或过渡语。首次交流时可以自然问候，后续应直接进入问题。
+5. 回答不使用固定模板。可以先在内部判断问题、原因和修改方向，但输出时要组织成自然的课堂对话，不必机械地分成“问题、原因、建议”三个部分。
+6. 内容较少时，可以直接用一段话回答；只有确实存在多个步骤、角色或检查项目时，才使用①②③分点。
+7. 分点提示统一使用“①②③”，不要使用“（1）（2）（3）”或“1. 2. 3.”。
+8. 如果信息不足，最多追问2个关键问题。调试类问题通常只追问1个最关键的问题。
+9. 如果是调试问题，优先判断一个最可能的原因，并给出一个最关键的检查或修改方向。
+10. 如果当前信息只能确定检查方向，不能把推测当作已经确认的错误，应使用“先检查……”“看看是否……”等谨慎表达。
+11. 如果是任务分析，采用“作品 → 角色 → 动作、规则、效果”的方式引导。
+12. 如果学生说“帮我画思维导图”“帮我梳理逻辑”“我不知道怎么分析作品”，应帮助学生整理文字版任务分析框架，但不能替学生完成全部创作内容。
+13. 如果是作品优化，只给1—2个与当前作品最相关、学生能够自己尝试的建议。
+14. 鼓励学生修改后运行并观察效果，但不要每次都固定使用“再运行看看”“试试看”等相同结尾。
+15. 不使用Markdown表格，不得出现<br>、<p>、<div>等HTML标签。
+16. 不要使用Markdown加粗、斜体或代码符号，例如**重点**、*内容*、`代码`。
+17. 不要输出空编号、空项目或占位符。如果不知道作品中的角色、规则或运行现象，应直接请学生补充。
+18. 不要输出只有一个词的小标题，例如“隐藏”“滑行”“克隆”。需要小标题时，应使用能够表达完整意思的短语。
+19. 普通问题原则上控制在3—5句话以内，单次回答一般不超过150字。
+20. 截图调试类问题一般控制在2—3句话以内，原则上不超过100字。
+21. 不要一次提供多个解决方案。一个方法能够解决当前问题时，不再补充第二种、第三种方法。
+22. 只有学生继续追问，或者第一个修改方法没有解决问题时，才进入下一步排查。
+23. 不主动扩展新的知识点、复杂技巧或进阶做法，优先帮助学生解决当前问题。
+24. 对方向、坐标、广播、变量等概念，只解释解决当前问题所必需的内容，一般用1句话说明。
+25. 知识库内容只作为后台参考。回答时要结合当前主题、角色名称和学生表达进行自然改写，不照抄“核心说明、可能原因、学生端引导提示、回答边界”等字段内容。
+26. 学生端截图调试中，如果截图已经能够明确定位错误，回答应包含：简短原因、具体修改方法、与当前错误直接相关的局部程序框、运行验证提示。
+27. 局部程序框只展示需要修改的这一段角色脚本，不展示其他角色程序，不补充关卡、计时、生命值等无关功能。程序框必须使用以下标记，且标记单独占一行：
+[[PROGRAM]]
+程序内容
+[[/PROGRAM]]
 
 二、关于“怎么做某个作品”的回答规则
-
 1. 当学生问“怎么做某个作品”“这个游戏怎么做”“帮我做某个作品”时，默认判断为任务分析类问题。
-2. 第一次回答只能帮助学生分析任务，不得直接给出具体积木名称、积木连接顺序或完整操作步骤。
-3. 第一次回答必须围绕“作品 → 角色 → 动作、规则、效果”展开。
-4. 第一次回答最后只能追问1—2个问题，引导学生明确最基础的小功能。
-5. 只有当学生已经明确目标功能，或者说明“我已经用了哪些积木、现在出现什么问题”时，才可以提示关键积木类别。
-6. 即使提示积木，也不能一次性给出完整程序顺序，只能给1—2个提示或检查方向。
-7. 不得使用“第一步拖出……第二步拖出……第三步添加……”这种完整操作式回答。
-8. 对基础任务，应先引导学生思考“动作是否需要重复”“触发条件是什么”“角色碰到边缘后应怎样变化”，再根据学生回答继续推进。
+2. 第一次回答只能帮助学生理解任务和拆分作品，不得直接给出具体积木名称、积木连接顺序或完整操作步骤。
+3. 第一次回答应围绕“作品 → 角色 → 动作、规则、效果”展开。
+4. 如果学生只说了作品名称，没有说明角色和功能，应自然地追问1—2个问题，例如作品里有哪些角色、角色需要完成什么动作。
+5. 第一次回答结束时，应引导学生先明确或完成一个最基础的小功能，不要同时安排多个复杂功能。
+6. 只有学生已经明确目标功能，或者说明自己用了哪些积木、出现了什么问题时，才可以提示关键积木类别。
+7. 即使提示积木，也不能一次给出完整程序顺序，只能给一个关键提示，必要时再补充第二个检查方向。
+8. 不得使用“第一步拖出……第二步拖出……第三步添加……”这种可以直接照做的完整操作式回答。
+9. 对基础任务，应优先引导学生思考：
+   ① 动作什么时候开始；
+   ② 动作是否需要重复；
+   ③ 什么条件会触发变化；
+   ④ 运行后应该看到什么效果。
 
 三、关于课堂表现评价
-
-1. 当学生要求“评价我这节课的表现”“评价我的课堂表现”“我这节课表现怎么样”时，不得直接判断学生表现好坏，因为你无法完整观察学生课堂行为。
-2. 应提供统一的自我评价框架，引导学生从任务理解、任务分析、程序搭建、调试修改、合作交流、作品优化等方面进行回顾。
-3. 可以用分点方式呈现评价维度，但不得直接给学生打分。
+1. 当学生要求“评价我这节课的表现”“评价我的课堂表现”“我这节课表现怎么样”时，不得直接判断学生表现好坏，因为你无法完整观察学生的课堂行为。
+2. 应引导学生从任务理解、任务分析、程序搭建、调试修改、合作交流和作品优化等方面进行自我回顾。
+3. 可以用简短分点呈现评价维度，但不得直接给学生打分。
 4. 不得替代教师进行正式评价。
-5. 如果学生进一步说明自己完成了哪些功能、遇到了什么问题、如何解决问题，可以帮助学生整理一段学习表现小结，并提出1—2条具体改进建议。
-6. 回答时应避免直接说“你表现很好”“你完成得很棒”等缺乏依据的判断。
+5. 如果学生说明了自己完成的功能、遇到的问题和解决过程，可以帮助学生整理一段学习表现小结，并提出1—2条具体改进建议。
+6. 不要在缺乏依据时直接说“你表现很好”“你完成得很棒”等判断性内容。
 
 四、关于图形化编程功能解释
-
-1. 必须区分“图形化编程内置积木可以直接实现”和“需要额外程序实现”的情况。
+1. 必须区分“图形化编程内置积木可以直接实现”和“需要组合其他积木或编写额外程序实现”的情况。
 2. 不得把不同效果混为一谈。
-3. 不得主动编造多个复杂实现方案。
-4. 如果确实需要提供多个方案，必须说明哪个是基础方案，哪个是进阶方案。
-5. 面向初学者时，应优先推荐课堂中最基础、最稳定的实现方式，不要一开始引入过难的坐标判断、广播、克隆等内容。
+3. 不主动编造多个复杂实现方案。
+4. 如果确实需要说明多个方案，应先介绍最基础、最稳定的方案。只有学生继续追问时，再说明进阶方案。
+5. 面向初学者时，不要一开始就引入过难的坐标判断、广播、克隆或复杂变量结构。
+6. 使用积木名称时，应尽量采用图形化编程软件中真实显示的名称，避免学生找不到对应积木。
 
 五、关于边缘处理的解释
-
-1. “碰到边缘就反弹”是图形化编程内置积木可以直接实现的基础功能。
-2. “从一端出去，从另一端出现”可以实现，但不是一个现成积木，需要用坐标判断，例如判断 x 坐标是否超过舞台边界。
-3. “碰到边缘后掉头”在基础作品中通常可以用“碰到边缘就反弹”加“将旋转方式设为左右翻转”来实现。
-4. 不要把“碰到边缘就反弹”和“穿屏出现”说成同一个功能。
-5. 对第一节或基础任务，不主动推荐“穿屏出现”这种进阶效果。
-
-六、关于某个主题
-
-如果学生问“xx怎么做”，应优先引导其完成基础版。
-
-不得一开始就把任务扩展成复杂游戏，不得主动生成过多复杂规则。
-
+1. “碰到边缘就反弹”是图形化编程中的内置积木，可以直接实现基础反弹效果。
+2. “从舞台一端出去，再从另一端出现”不是一个现成积木，通常需要使用坐标和条件判断实现。
+3. 角色碰到边缘后发生倒立或翻转时，应优先检查旋转方式。需要角色保持直立时，通常使用“左右翻转”。
+4. 不要把“碰到边缘就反弹”和“从另一端出现”说成同一个功能。
+5. 对基础课堂任务，不主动推荐“穿屏出现”等进阶效果。
+六、关于具体课堂主题
+1. 如果学生问“某个主题怎么做”，应优先引导其完成基础版作品。
+2. 不得一开始就把任务扩展成复杂游戏，也不得主动添加教师没有要求的倒计时、关卡、生命值、胜负界面等规则。
+3. 当前主题只用于帮助理解学生问题。不同主题中出现的相同程序问题，应使用通用图形化编程知识进行解释。
+4. 回答时可以将知识库中的“角色”自然替换成学生当前作品中的具体角色，例如小猫、老鼠、地鼠、锤子或苹果。
 七、关于任务分析和逻辑梳理
-
 1. 当学生说“帮我梳理逻辑”“我不知道怎么分析作品”“帮我整理思路”时，应按照“主题 → 背景 → 角色”的结构帮助学生整理。
-2. 其中“角色”是重点，每个角色下面继续分析：
-① 动作：这个角色要做什么；
-② 规则：什么情况下触发，和谁发生关系；
-③ 效果：运行后会看到什么变化。
-3. 如果作品没有背景，不要写“背景”这一项。
-4. 不要为了结构完整而编造不存在的角色、背景或规则。
-5. 如果学生只说了作品主题，应先追问：作品里有哪些角色？每个角色要做什么？
-6. 如果学生已经说明角色和功能，可以帮助学生整理成文字版任务分析框架。
-7. 输出时可以采用下面这种格式：
+2. 角色部分是任务分析的重点，每个角色继续分析：
+   ① 动作：这个角色需要做什么；
+   ② 规则：动作什么时候发生，与哪个角色或条件有关；
+   ③ 效果：程序运行后能够看到什么变化。
+3. 如果作品没有背景，不要为了结构完整而增加“背景”部分。
+4. 不要编造学生没有提到的角色、背景、规则或功能。
+5. 如果学生只说了作品主题，应先询问作品中有哪些角色、每个角色需要做什么。
+6. 如果学生已经说明了角色和主要功能，可以帮助学生整理成文字版任务分析框架。
+7. 任务分析可以采用以下形式，但应根据学生实际内容灵活调整，不要机械照抄：
 
 主题：猫捉老鼠
 
@@ -769,15 +1106,71 @@ def build_role_prompt(role: str) -> str:
 房间背景
 
 角色：
+
 小猫
-- 动作：根据方向键移动
-- 规则：碰到老鼠时触发反馈
-- 效果：老鼠被抓到或出现提示
+
+* 动作：根据方向键移动
+* 规则：碰到老鼠时触发反馈
+* 效果：老鼠被抓到或出现提示
 
 老鼠
-- 动作：随机移动或躲避小猫
-- 规则：被小猫碰到后隐藏或结束游戏
-- 效果：游戏出现结果反馈
+
+* 动作：在舞台中移动
+* 规则：被小猫碰到后发生变化
+* 效果：隐藏、重新出现或显示结果
+
+八、关于截图调试问题
+
+1. 当学生同时输入文字问题并上传截图时，必须以学生的文字问题为主，结合截图中与该问题直接相关的程序证据回答，不得脱离学生问题另行分析。
+2. 当学生只上传截图、没有输入文字问题时，默认任务是“分析这张程序截图中存在哪些问题”。应主动检查截图中能够直接确认的程序问题，不得只做文字识别。
+3. 内部分析时必须按以下顺序检查：
+   ① 截图中共有几段脚本，每段脚本从哪个事件开始；
+   ② 每段脚本中能够明确看见哪些积木、数值和消息名称；
+   ③ 同一个角色的多段脚本是否同时修改造型、位置、方向、大小、显示状态或变量；
+   ④ 条件是否被放进了正确的积木槽位；
+   ⑤ 程序运行顺序是否会造成重复执行、脚本冲突或状态无法恢复。
+4. 不得根据常见错误自行补全截图。截图中已经存在“等待1秒”时，不得回答“显示和隐藏之间没有等待”；截图中已经存在某个积木时，不得回答“缺少该积木”。
+5. 必须区分以下积木：
+   ① “等待几秒”的输入框需要数值，它不是等待条件成立；
+   ② “等待直到”用于等待条件成立；
+   ③ “如果……那么……”用于条件成立后执行一组积木；
+   ④ “循环执行”会持续运行，放在点击事件下也不会自动结束。
+6. 如果同一角色存在多段脚本，应检查它们是否并发修改同一属性。两段脚本同时切换造型、显示/隐藏或改变位置时，应优先考虑脚本冲突，不能只分析其中一段。
+7. 当学生提出了明确问题时，只指出与该问题关系最直接、证据最充分的一个主要问题，并给出一个最相关的修改方向。
+8. 当学生只上传截图时，先指出截图中最主要、最确定的问题；如果截图还明确显示第二个与程序运行直接相关的问题，可以再简要指出第二个问题。不要一次罗列大量可能原因。
+9. 每个确认的问题只给一个修改方向。修改方向必须具体说明“现有程序中的哪个积木要怎样改”，不能只说“删掉脚本”“只保留另一段脚本”“重新写一遍”。应优先保留学生已有程序，例如提示“把循环执行改成一次执行”“把等待中的条件改为固定秒数”“把条件放入如果……那么”。
+9.1 回答和程序框必须逐字保留学生截图中每一个已有积木的原文，不只包括“重复执行/循环执行”，还包括事件、条件、运算符、角色名、碰撞对象、造型名、消息名、变量名、数值和动作积木。不得自行统一术语或用近义表达替换。
+9.2 修改程序时，应优先复制学生原脚本，只调整积木位置、嵌套层级或当前错误对应的参数。只有确实缺少解决当前问题所必需的积木时，才允许新增；新增积木优先采用同一截图中已经出现的平台术语。
+9.3 如果视觉证据不足以确认某个积木的准确名称、参数或连接关系，不得生成程序框，应只追问一个关键问题。
+10. 当截图已经能够明确定位错误时，应在原因和修改说明后，展示一段“修改后的关键程序”。只展示与当前问题直接相关的脚本，不展示整个作品。程序框使用 [[PROGRAM]] 与 [[/PROGRAM]] 包住，并保持积木的缩进层级。
+11. 只有当整段脚本与任务完全无关、且无法通过调整其中积木修复时，才可以建议删除；一般调试问题不得把“删除整段脚本”作为首选建议。
+12. 如果当前问题有多个明确关联的错误，可以在同一个局部程序框中给出能够直接修复当前现象的正确结构；仍不得一次给出所有角色的完整程序。
+13. 如果截图结构分析与OCR文字相互矛盾，或者积木被遮挡、文字过小、连接关系看不清，不要猜测。应说明当前截图能够确认的内容，并只追问一个关键问题。
+14. 如果学生只上传截图，但无法判断其作品目标或预期效果，可以先指出截图中能够直接确认的结构问题；如果没有可确认的问题，再追问“你希望程序实现什么效果？”或“运行后出现了什么现象？”。
+15. 当截图中已经能够判断错误设置和正确修改值时，应给出唯一、明确的修改建议，不再补充无关备选方案。
+16. 截图调试回答按“原因说明—正确做法—局部程序框—运行验证”组织。程序框外的文字应简短，整段回答以学生能够快速看懂为准。
+17. 调试类回答应像教师在学生身边进行即时指导，不要写成错误分析报告，也不要在结尾总结“核心问题是……”。
+
+九、自然对话表达规则
+1. 回答应像教师在学生旁边进行简短指导，不要像说明书、知识点讲解或评价报告。
+2. 学生问题已经明确时，直接回答，不重复学生的原话，不使用“你的问题是……”“人歪了”“角色不动了”等生硬开头。
+3. 简单问题优先使用1—2句话回答。第一句话指出截图中能够确认的设置或现象，第二句话说明最关键的修改方法。
+4. 不强制使用分段、编号或固定结构。只有确实存在多个步骤时，才使用①②③。
+5. 不主动解释积木的一般原理。只有学生不理解为什么需要这样修改时，才补充一句简短解释。
+6. 回答时应使用截图中具体的信息，例如：
+   “角色方向现在是60°”
+   “程序中使用的是面向鼠标指针”
+   “显示和隐藏之间没有等待”
+   不要使用“方向积木控制角色朝哪个角度”等抽象、书面化表达。
+7. 不要照搬学生的口语表达。例如学生说“人为什么是歪的”，回答时应使用“角色方向”“人物显示”等准确表达，不重复说“人歪了”。
+8. 不要每次使用“你可以这样调整”“试试看”“再运行看看”“就可以了”等相同句式。根据问题自然结束回答。
+9. 截图能够明确判断时，直接给出结论和修改方法，不使用“可能是”“通常是”等模糊表达。
+10. 截图不能明确判断时，应使用“从目前截图还不能确定”“先检查……”等谨慎表达，并只追问一个关键问题。
+11. 知识库只提供判断依据。回答时必须重新组织语言，不得照抄知识库中的“学生端引导提示”。
+12. 截图结构分析只作为后台证据，不要把“各段脚本、视觉分析结果”等内部分析全文展示给学生。
+13. 学生端可以使用程序框展示“当前错误对应的修改后局部脚本”。程序框应像积木从上到下的连接顺序一样缩进，便于学生对照自己的程序修改；不得用程序框展示整个作品。
+14. 回答中不添加无关的问候、鼓励、总结或扩展知识。解决当前问题后即可结束。
+
 """
 
 
@@ -795,6 +1188,7 @@ def save_log(
     uploaded_image_name="",
     uploaded_image_path="",
     ocr_text="",
+    screenshot_analysis="",
     uploaded_image_base64=""
 ):
     os.makedirs("logs", exist_ok=True)
@@ -811,6 +1205,7 @@ def save_log(
         "uploaded_image_name": uploaded_image_name,
         "uploaded_image_path": uploaded_image_path,
         "ocr_text": ocr_text,
+        "screenshot_analysis": screenshot_analysis,
         "uploaded_image_base64": uploaded_image_base64
     }
 
@@ -831,7 +1226,7 @@ def load_logs():
     log_path = "logs/chat_logs.csv"
     columns = [
         "time", "role", "student_name", "group_no", "topic",
-        "user_input", "answer", "uploaded_image_name", "uploaded_image_path", "ocr_text", "uploaded_image_base64"
+        "user_input", "answer", "uploaded_image_name", "uploaded_image_path", "ocr_text", "screenshot_analysis", "uploaded_image_base64"
     ]
 
     if not os.path.exists(log_path):
@@ -919,7 +1314,7 @@ def create_excel_with_images(logs_df):
 
     headers = [
         "时间", "身份", "小组号", "当前主题",
-        "学生/教师问题", "上传截图", "智能体回答", "OCR识别文字"
+        "学生/教师问题", "上传截图", "智能体回答", "OCR识别文字", "截图结构分析"
     ]
     ws.append(headers)
 
@@ -932,6 +1327,7 @@ def create_excel_with_images(logs_df):
         "F": 36,
         "G": 70,
         "H": 48,
+        "I": 58,
     }
     for col, width in column_widths.items():
         ws.column_dimensions[col].width = width
@@ -1023,6 +1419,7 @@ def create_excel_with_images(logs_df):
         ws.cell(excel_row, 5, clean_question_for_excel(row.get("user_input", "")))
         ws.cell(excel_row, 7, safe_cell(row.get("answer", "")))
         ws.cell(excel_row, 8, safe_cell(row.get("ocr_text", "")))
+        ws.cell(excel_row, 9, safe_cell(row.get("screenshot_analysis", "")))
 
         # 行高要足够，否则图片虽然插入了，但看起来像“没显示”。
         ws.row_dimensions[excel_row].height = 145
@@ -1045,7 +1442,7 @@ def create_excel_with_images(logs_df):
         else:
             ws.cell(excel_row, 6, "")
 
-        for col_idx in range(1, 9):
+        for col_idx in range(1, 10):
             ws.cell(excel_row, col_idx).alignment = Alignment(wrap_text=True, vertical="top")
 
     output = io.BytesIO()
@@ -1234,6 +1631,18 @@ def format_message_content(content: str) -> str:
     while i < len(lines):
         line = lines[i]
         stripped_raw = line.strip()
+
+        if stripped_raw == "[[PROGRAM]]":
+            program_lines = []
+            i += 1
+            while i < len(lines) and lines[i].strip() != "[[/PROGRAM]]":
+                program_lines.append(lines[i].rstrip())
+                i += 1
+            if i < len(lines) and lines[i].strip() == "[[/PROGRAM]]":
+                i += 1
+            program_text = html.escape("\n".join(program_lines).strip("\n"))
+            parts.append('<div class="program-block"><pre>' + program_text + '</pre></div>')
+            continue
 
         if is_table_line(line):
             table_lines = []
@@ -1675,9 +2084,9 @@ def load_teacher_cases_text():
     文件名固定为 teacher_cases.xlsx，放在和本 .py 文件同一目录。
     案例集用于帮助智能体学习教师评分尺度，不要求普通教师每次上传。
     """
-    case_path = "teacher_cases.xlsx"
+    case_path = APP_DIR / "teacher_cases.xlsx"
 
-    if not os.path.exists(case_path):
+    if not case_path.exists():
         return "未检测到 teacher_cases.xlsx，本次仅依据评分规则和教师上传评价量表进行评价。"
 
     try:
@@ -1893,6 +2302,960 @@ def recognize_image_text(uploaded_file):
 
     except Exception as e:
         return f"图片文字识别失败：{e}"
+
+
+
+
+def analyze_student_screenshot_with_qwen_vl(uploaded_file, student_question=""):
+    """
+    使用 Qwen-VL 读取截图中所有可见的独立脚本，并输出结构化 JSON。
+
+    视觉模型只负责提取证据，不直接判断最终原因。后续程序会逐段分析，
+    再结合学生本轮问题进行综合诊断。
+    """
+    if uploaded_file is None:
+        return json.dumps({
+            "current_object": "",
+            "script_count": 0,
+            "scripts": [],
+            "other_visible_settings": [],
+            "uncertainties": ["本轮未上传截图"],
+        }, ensure_ascii=False)
+
+    if ocr_client is None:
+        return json.dumps({
+            "current_object": "",
+            "script_count": 0,
+            "scripts": [],
+            "other_visible_settings": [],
+            "uncertainties": ["未配置DASHSCOPE_API_KEY，无法进行截图结构分析"],
+        }, ensure_ascii=False)
+
+    try:
+        image_url = image_file_to_data_url(uploaded_file)
+        prompt = f"""
+你是小学图形化编程截图的“程序结构提取器”，不是答题助手。
+请读取截图中所有真正可见的独立脚本，并严格输出一个 JSON 对象。不要输出解释、Markdown 或代码围栏。
+
+学生本轮问题：
+{str(student_question or '')[:500]}
+
+提取规则：
+1. 一个独立的事件帽积木及其下方连接的积木，算一段脚本。
+2. 截图中有几段可见脚本，就必须输出几段；脚本数量不限，不能只输出前两段。
+3. 不得补全被遮挡、过小或看不清的积木；不确定的内容写入 uncertainties。
+4. 每段脚本必须单独记录，不得把不同脚本合并。
+5. 按从上到下的顺序记录积木；保留截图中的角色名、消息名、造型名、变量名和数值。
+5.1 必须逐字保留截图中的积木名称和平台用语，例如“重复执行”“循环执行”“重复执行直到”不得互相替换。
+6. 对每个积木标记 nesting_depth：事件帽积木为0；事件下直接连接的积木为1；循环或条件内部的积木继续递增。
+7. 对条件积木标记 inside_loop；对等待积木标记 input_type，只能是 number、boolean、unclear。
+8. modifies 只能从 costume、visibility、position、direction、size、variable、sound、broadcast 中选择。
+9. 只提取截图证据，不给修改方案，不判断学生应该怎样做。
+10. text 与 input_text 必须使用截图中的原始积木文字，不得把“重复执行”改成“循环执行”，不得替换角色名、造型名、消息名、变量名、运算符或数值。
+11. confidence 取0到1；文字、连接或层级不能确认时应降低 confidence，并在 uncertainties 中说明。
+
+JSON 格式：
+{{
+  "current_object": "当前选中的角色或舞台名称；看不清则为空字符串",
+  "script_count": 0,
+  "scripts": [
+    {{
+      "id": "script_1",
+      "event": "事件帽积木原文",
+      "has_forever_loop": false,
+      "blocks": [
+        {{
+          "order": 1,
+          "nesting_depth": 0,
+          "text": "积木完整原文，必须逐字保留",
+          "block_type": "event|loop|condition|wait|action|other",
+          "inside_loop": false,
+          "inside_condition": false,
+          "input_type": "number|boolean|unclear|none",
+          "input_text": "该积木输入槽中可见内容的原文；没有则为空字符串",
+          "confidence": 0.0
+        }}
+      ],
+      "modifies": [],
+      "uncertainties": []
+    }}
+  ],
+  "other_visible_settings": [],
+  "uncertainties": []
+}}
+"""
+
+        response = ocr_client.chat.completions.create(
+            model=QWEN_VL_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }
+            ],
+            temperature=0,
+            max_tokens=2600,
+        )
+
+        raw_text = response.choices[0].message.content or ""
+        parsed = parse_screenshot_structure(raw_text)
+        return json.dumps(parsed, ensure_ascii=False)
+
+    except Exception as exc:
+        return json.dumps({
+            "current_object": "",
+            "script_count": 0,
+            "scripts": [],
+            "other_visible_settings": [],
+            "uncertainties": [f"截图结构分析失败：{exc}"],
+        }, ensure_ascii=False)
+
+
+def safe_bool(value, default=False):
+    """可靠解析视觉模型返回的布尔值，避免字符串“false”被当成True。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "1", "yes", "是"}:
+        return True
+    if normalized in {"false", "0", "no", "否", ""}:
+        return False
+    return default
+
+
+def safe_float(value, default=0.0):
+    try:
+        number = float(value)
+    except Exception:
+        return default
+    return max(0.0, min(1.0, number))
+
+
+def parse_screenshot_structure(raw_text: str) -> dict:
+    """解析并规范视觉模型返回的 JSON；失败时返回可安全处理的空结构。"""
+    default = {
+        "current_object": "",
+        "script_count": 0,
+        "scripts": [],
+        "other_visible_settings": [],
+        "uncertainties": [],
+    }
+    text = str(raw_text or "").strip()
+    if not text:
+        default["uncertainties"] = ["视觉模型未返回内容"]
+        return default
+
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(text[start:end + 1])
+            except Exception:
+                default["uncertainties"] = ["截图结构JSON解析失败"]
+                return default
+        else:
+            default["uncertainties"] = ["截图结构JSON解析失败"]
+            return default
+
+    if not isinstance(data, dict):
+        default["uncertainties"] = ["截图结构不是JSON对象"]
+        return default
+
+    scripts = data.get("scripts", [])
+    if not isinstance(scripts, list):
+        scripts = []
+
+    normalized_scripts = []
+    for index, script in enumerate(scripts, start=1):
+        if not isinstance(script, dict):
+            continue
+        blocks = script.get("blocks", [])
+        if not isinstance(blocks, list):
+            blocks = []
+        normalized_blocks = []
+        for order, block in enumerate(blocks, start=1):
+            if not isinstance(block, dict):
+                continue
+            normalized_blocks.append({
+                "order": int(block.get("order", order) or order),
+                "nesting_depth": int(block.get("nesting_depth", 0) or 0),
+                "text": str(block.get("text", "") or "").strip(),
+                "block_type": str(block.get("block_type", "other") or "other").strip().lower(),
+                "inside_loop": safe_bool(block.get("inside_loop", False)),
+                "inside_condition": safe_bool(block.get("inside_condition", False)),
+                "input_type": str(block.get("input_type", "none") or "none").strip().lower(),
+                "input_text": str(block.get("input_text", "") or "").strip(),
+                "confidence": safe_float(block.get("confidence", 1.0), 1.0),
+            })
+        normalized_scripts.append({
+            "id": str(script.get("id", f"script_{index}") or f"script_{index}"),
+            "event": str(script.get("event", "") or "").strip(),
+            "has_forever_loop": safe_bool(script.get("has_forever_loop", False)),
+            "blocks": sorted(normalized_blocks, key=lambda item: item["order"]),
+            "modifies": [str(x) for x in script.get("modifies", []) if str(x).strip()] if isinstance(script.get("modifies", []), list) else [],
+            "uncertainties": [str(x) for x in script.get("uncertainties", []) if str(x).strip()] if isinstance(script.get("uncertainties", []), list) else [],
+        })
+
+    reported_count = data.get("script_count", len(normalized_scripts))
+    try:
+        reported_count = int(reported_count)
+    except Exception:
+        reported_count = len(normalized_scripts)
+
+    uncertainties = data.get("uncertainties", [])
+    if not isinstance(uncertainties, list):
+        uncertainties = [str(uncertainties)] if uncertainties else []
+    if reported_count != len(normalized_scripts):
+        uncertainties.append(
+            f"视觉模型报告{reported_count}段脚本，但实际解析到{len(normalized_scripts)}段"
+        )
+
+    return {
+        "current_object": str(data.get("current_object", "") or "").strip(),
+        "script_count": len(normalized_scripts),
+        "scripts": normalized_scripts,
+        "other_visible_settings": data.get("other_visible_settings", []) if isinstance(data.get("other_visible_settings", []), list) else [],
+        "uncertainties": [str(x) for x in uncertainties if str(x).strip()],
+    }
+
+
+def get_screenshot_structure(screenshot_analysis) -> dict:
+    """兼容 JSON 字符串或字典形式的截图结构。"""
+    if isinstance(screenshot_analysis, dict):
+        return screenshot_analysis
+    return parse_screenshot_structure(str(screenshot_analysis or ""))
+
+
+def script_text(script: dict) -> str:
+    parts = [str(script.get("event", "") or "")]
+    parts.extend(str(block.get("text", "") or "") for block in script.get("blocks", []))
+    return "\n".join(part for part in parts if part).strip()
+
+
+def script_compact(script: dict) -> str:
+    return re.sub(r"\s+", "", script_text(script))
+
+
+def script_has_loop(script: dict) -> bool:
+    if script.get("has_forever_loop"):
+        return True
+    for block in script.get("blocks", []):
+        text = re.sub(r"\s+", "", str(block.get("text", "") or ""))
+        if block.get("block_type") == "loop" or any(word in text for word in ["循环执行", "重复执行", "重复执行直到"]):
+            return True
+    return False
+
+
+def find_relevant_hit_scripts(structure: dict):
+    """在所有脚本中查找包含鼠标与碰撞判断的脚本。"""
+    results = []
+    for script in structure.get("scripts", []):
+        compact = script_compact(script)
+        has_mouse = any(term in compact for term in ["按下鼠标", "鼠标按下", "鼠标键按下", "按下鼠标键"])
+        has_touch = "碰到" in compact
+        has_condition = any(
+            block.get("block_type") == "condition" or "如果" in str(block.get("text", ""))
+            for block in script.get("blocks", [])
+        )
+        if has_mouse and has_touch and has_condition:
+            condition_blocks = [
+                block for block in script.get("blocks", [])
+                if block.get("block_type") == "condition" or "如果" in str(block.get("text", ""))
+            ]
+            condition_inside_loop = any(bool(block.get("inside_loop")) for block in condition_blocks)
+            results.append({
+                "script": script,
+                "condition_inside_loop": condition_inside_loop,
+                "has_loop": script_has_loop(script),
+            })
+    return results
+
+
+def find_boolean_wait_errors(structure: dict):
+    """查找把布尔条件放入‘等待若干秒’数值输入框的脚本。"""
+    errors = []
+    for script in structure.get("scripts", []):
+        for block in script.get("blocks", []):
+            text = re.sub(r"\s+", "", str(block.get("text", "") or ""))
+            if block.get("block_type") == "wait" and block.get("input_type") == "boolean":
+                errors.append({"script": script, "block": block})
+            elif "等待" in text and "秒" in text and ("按下鼠标" in text or "碰到" in text) and ("与" in text or "且" in text):
+                errors.append({"script": script, "block": block})
+    return errors
+
+
+def find_parallel_modification_conflicts(structure: dict):
+    """综合所有脚本，查找两段及以上持续脚本同时修改同一属性的情况。"""
+    property_to_scripts = {}
+    for script in structure.get("scripts", []):
+        if not script_has_loop(script):
+            continue
+        for prop in script.get("modifies", []):
+            property_to_scripts.setdefault(prop, []).append(script)
+    return {
+        prop: scripts
+        for prop, scripts in property_to_scripts.items()
+        if len(scripts) >= 2
+    }
+
+
+def classify_student_debug_intent(student_question: str) -> str:
+    """根据学生本轮文字问题判断当前最需要解释的运行现象。"""
+    question = re.sub(r"\s+", "", str(student_question or ""))
+
+    if any(word in question for word in ["闪", "闪现", "不停切换", "一直切换"]):
+        return "flicker"
+    if (
+        any(word in question for word in ["打到", "击中", "点击", "碰到"])
+        and any(word in question for word in ["不哭", "没有哭", "没哭", "不变造型", "没反应", "没有反应"])
+    ):
+        return "hit_feedback_missing"
+    if any(word in question for word in ["不加分", "分数不变", "得分不增加", "没有加分"]):
+        return "score_not_increasing"
+    if any(word in question for word in ["只执行一次", "只动一次", "只出现一次"]):
+        return "runs_once"
+    if any(word in question for word in ["一直加分", "分数一直增加", "连续加分"]):
+        return "score_repeats"
+    if any(word in question for word in ["不动", "没有移动", "不跟随"]):
+        return "not_moving"
+    return "general"
+
+
+def extract_hit_target_from_structure(structure: dict, ocr_text: str = "") -> str:
+    combined = "\n".join(script_text(script) for script in structure.get("scripts", [])) + "\n" + str(ocr_text or "")
+    compact = re.sub(r"\s+", "", combined)
+    patterns = [
+        r"碰到[“\"']?([^？?<>〈〉（）()\s]{1,12})[”\"']?[？?]",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, compact)
+        if match:
+            target = match.group(1).strip("？?<>〈〉")
+            if target and target not in ["鼠标指针", "边缘"]:
+                return target
+    for candidate in ["地鼠锤子", "锤子", "捕虫网", "小猫", "老鼠", "电池", "星星", "宝箱"]:
+        if candidate in compact:
+            return candidate
+    return "目标角色"
+
+
+def extract_costume_sequence(script: dict):
+    names = []
+    for block in script.get("blocks", []):
+        text = str(block.get("text", "") or "")
+        match = re.search(r"换成[“\"']?(.+?)[”\"']?造型", text)
+        if match:
+            name = match.group(1).strip(" “\"'”")
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def extract_wait_seconds(script: dict, default="0.5") -> str:
+    for block in script.get("blocks", []):
+        if block.get("block_type") == "wait" and block.get("input_type") == "number":
+            match = re.search(r"等待\s*([0-9]+(?:\.[0-9]+)?)\s*秒", str(block.get("text", "")))
+            if match:
+                return match.group(1)
+    return default
+
+
+def extract_exact_block_label(script: dict, block_type: str, candidates=None, default="") -> str:
+    """从截图结构中提取学生实际使用的积木原文。"""
+    candidates = candidates or []
+    for block in script.get("blocks", []):
+        text = str(block.get("text", "") or "").strip()
+        compact = re.sub(r"\s+", "", text)
+        if block.get("block_type") == block_type:
+            if candidates:
+                for candidate in candidates:
+                    if candidate in compact:
+                        return candidate
+            if text:
+                return text
+        for candidate in candidates:
+            if candidate in compact:
+                return candidate
+    return default
+
+
+def infer_loop_label(script: dict, structure: dict = None) -> str:
+    """优先使用当前脚本或同一截图中实际出现的持续循环积木名称。"""
+    labels = ["重复执行直到", "重复执行", "循环执行"]
+    label = extract_exact_block_label(script, "loop", labels, "")
+    if label and label != "重复执行直到":
+        return label
+    if structure:
+        for other in structure.get("scripts", []):
+            label = extract_exact_block_label(other, "loop", labels, "")
+            if label and label != "重复执行直到":
+                return label
+    # 截图中缺少该类积木时，只能使用当前平台最常见的标准名称。
+    return "循环执行"
+
+
+def get_event_text(script: dict) -> str:
+    event = str(script.get("event", "") or "").strip()
+    if event:
+        return event
+    for block in script.get("blocks", []):
+        if block.get("block_type") == "event":
+            return str(block.get("text", "") or "").strip()
+    return ""
+
+
+def get_non_event_blocks(script: dict):
+    """返回脚本中除事件帽积木外的全部积木，保持截图原顺序。"""
+    event = re.sub(r"\s+", "", get_event_text(script))
+    result = []
+    event_skipped = False
+    for block in sorted(script.get("blocks", []), key=lambda item: item.get("order", 0)):
+        text = str(block.get("text", "") or "").strip()
+        compact = re.sub(r"\s+", "", text)
+        if block.get("block_type") == "event" or (event and compact == event and not event_skipped):
+            event_skipped = True
+            continue
+        if text:
+            result.append(block)
+    return result
+
+
+def block_indent(block: dict, base_shift: int = 0) -> str:
+    depth = max(1, int(block.get("nesting_depth", 1) or 1) + base_shift)
+    return "    " * max(0, depth - 1)
+
+
+def render_script_exact(script: dict, insert_loop_label: str = "") -> str:
+    """
+    使用视觉模型提取的积木原文重建局部脚本。
+    除必要新增的循环外，不重写任何已有积木名称、参数或对象名称。
+    """
+    lines = []
+    event = get_event_text(script)
+    if event:
+        lines.append(event)
+    blocks = get_non_event_blocks(script)
+    if insert_loop_label:
+        lines.append(insert_loop_label)
+        for block in blocks:
+            lines.append("    " + block_indent(block) + str(block.get("text", "") or "").strip())
+    else:
+        for block in blocks:
+            lines.append(block_indent(block) + str(block.get("text", "") or "").strip())
+    return "\n".join(line for line in lines if line.strip())
+
+
+def extract_boolean_input_text(block: dict) -> str:
+    """提取被错误放入数值槽中的布尔条件原文。"""
+    input_text = str(block.get("input_text", "") or "").strip()
+    if input_text:
+        return input_text
+    text = str(block.get("text", "") or "").strip()
+    match = re.search(r"等待\s*(.*?)\s*秒", text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def infer_condition_wrapper(structure: dict, condition_text: str) -> str:
+    """优先参照同一截图中真实出现的条件积木写法；没有时使用平台标准写法。"""
+    for script in structure.get("scripts", []):
+        for block in script.get("blocks", []):
+            if block.get("block_type") != "condition":
+                continue
+            raw = str(block.get("text", "") or "").strip()
+            compact = re.sub(r"\s+", "", raw)
+            if "如果" in compact and "那么" in compact:
+                return f"如果 <{condition_text}> 那么"
+    return f"如果 <{condition_text}> 那么"
+
+
+def infer_numeric_wait_text(structure: dict, preferred_script: dict, default_seconds="0.5") -> str:
+    """优先复制截图中已出现的数值等待积木原文；没有时才新增标准等待积木。"""
+    scripts = [preferred_script] + [s for s in structure.get("scripts", []) if s is not preferred_script]
+    for script in scripts:
+        for block in script.get("blocks", []):
+            if block.get("block_type") == "wait" and block.get("input_type") == "number":
+                raw = str(block.get("text", "") or "").strip()
+                if raw:
+                    return raw
+    return f"等待{default_seconds}秒"
+
+
+def _costume_name_from_block(block: dict) -> str:
+    text = str(block.get("text", "") or "").strip()
+    match = re.search(r"换成\s*[“\"']?(.+?)[”\"']?\s*造型", text)
+    return match.group(1).strip(" ‘\"'”") if match else ""
+
+
+def _select_feedback_and_reset_costumes(blocks: list, student_question: str = ""):
+    """
+    依据学生提问与造型语义选择“击中反馈造型”和“恢复造型”。
+    只有证据明确时才调整顺序，避免机械保留错误顺序。
+    """
+    costume_blocks = [b for b in blocks if _costume_name_from_block(b)]
+    if len(costume_blocks) < 2:
+        return None, None
+
+    question = re.sub(r"\s+", "", str(student_question or ""))
+    feedback_keywords = ["哭", "受伤", "疼", "击中", "被打", "爆炸", "倒下", "死亡", "失败", "消失"]
+    reset_keywords = ["洞", "正常", "默认", "原始", "站立", "等待", "初始"]
+
+    def feedback_score(block):
+        name = _costume_name_from_block(block)
+        score = 0
+        if name and name in question:
+            score += 20
+        for kw in feedback_keywords:
+            if kw in question and kw in name:
+                score += 12
+            elif kw in name:
+                score += 4
+        if any(expr in question for expr in ["没有哭", "没哭", "不会哭", "不哭"]) and "哭" in name:
+            score += 20
+        return score
+
+    def reset_score(block):
+        name = _costume_name_from_block(block)
+        score = 0
+        for kw in reset_keywords:
+            if kw in name:
+                score += 8
+        return score
+
+    feedback = max(costume_blocks, key=feedback_score)
+    remaining = [b for b in costume_blocks if b is not feedback]
+    reset = max(remaining, key=reset_score) if remaining else None
+
+    if feedback_score(feedback) <= 0 or reset is None:
+        return None, None
+    return feedback, reset
+
+
+def build_boolean_wait_repair(
+    structure: dict,
+    script: dict,
+    bad_block: dict,
+    student_question: str = "",
+) -> str:
+    """
+    将错误的布尔等待槽改成“条件积木 + 数值等待”。
+    已有积木名称按截图原文保留，但会结合学生问题与正常运行逻辑，
+    将明确的反馈造型放在条件成立后，将恢复造型放在等待之后。
+    """
+    event = get_event_text(script)
+    loop_label = infer_loop_label(script, structure)
+    condition_text = extract_boolean_input_text(bad_block)
+    if not condition_text:
+        return ""
+    condition_line = infer_condition_wrapper(structure, condition_text)
+    wait_line = infer_numeric_wait_text(structure, script)
+
+    blocks = get_non_event_blocks(script)
+    bad_order = int(bad_block.get("order", 0) or 0)
+    remaining_blocks = [
+        block for block in blocks
+        if not (block is bad_block or int(block.get("order", 0) or 0) == bad_order)
+        and block.get("block_type") != "loop"
+    ]
+
+    feedback_block, reset_block = _select_feedback_and_reset_costumes(
+        remaining_blocks, student_question
+    )
+
+    lines = [event] if event else []
+    if script_has_loop(script):
+        existing_loop = extract_exact_block_label(script, "loop", default=loop_label)
+        lines.append(existing_loop or loop_label)
+    else:
+        lines.append(loop_label)
+    lines.append("    " + condition_line)
+
+    if feedback_block and reset_block:
+        # 明确的语义顺序：条件成立 → 反馈造型 → 等待 → 恢复造型。
+        lines.append("        " + str(feedback_block.get("text", "") or "").strip())
+        lines.append("        " + wait_line)
+        lines.append("        " + str(reset_block.get("text", "") or "").strip())
+        for block in remaining_blocks:
+            if block is feedback_block or block is reset_block:
+                continue
+            raw = str(block.get("text", "") or "").strip()
+            if raw:
+                lines.append("        " + raw)
+    else:
+        # 证据不足时不擅自改变动作含义，只修正条件与等待的结构。
+        before = []
+        after = []
+        for block in remaining_blocks:
+            raw = str(block.get("text", "") or "").strip()
+            if int(block.get("order", 0) or 0) < bad_order:
+                before.append(raw)
+            else:
+                after.append(raw)
+        for raw in before:
+            lines.append("        " + raw)
+        lines.append("        " + wait_line)
+        for raw in after:
+            lines.append("        " + raw)
+
+    return "\n".join(line for line in lines if line.strip())
+
+
+def build_missing_loop_repair(structure: dict, script: dict) -> str:
+    """
+    让相关条件进入持续检测。
+    没有循环时只新增一个循环；已有循环但条件在循环外时，只调整原有积木的嵌套层级。
+    """
+    loop_label = infer_loop_label(script, structure)
+    if not script_has_loop(script):
+        return render_script_exact(script, insert_loop_label=loop_label)
+
+    event = get_event_text(script)
+    blocks = get_non_event_blocks(script)
+    loop_indexes = [
+        index for index, block in enumerate(blocks)
+        if block.get("block_type") == "loop" or any(
+            word in re.sub(r"\s+", "", str(block.get("text", "") or ""))
+            for word in ["循环执行", "重复执行", "重复执行直到"]
+        )
+    ]
+    condition_indexes = [
+        index for index, block in enumerate(blocks)
+        if block.get("block_type") == "condition" or "如果" in str(block.get("text", "") or "")
+    ]
+    if not loop_indexes or not condition_indexes:
+        return render_script_exact(script)
+
+    loop_index = loop_indexes[0]
+    condition_index = condition_indexes[0]
+    lines = [event] if event else []
+    loop_depth = max(1, int(blocks[loop_index].get("nesting_depth", 1) or 1))
+    condition_order = int(blocks[condition_index].get("order", condition_index + 1) or condition_index + 1)
+
+    for index, block in enumerate(blocks):
+        raw = str(block.get("text", "") or "").strip()
+        depth = max(1, int(block.get("nesting_depth", 1) or 1))
+        # 条件及其后续同级动作移动到已有循环内部；已有更深层级继续保留相对嵌套。
+        if int(block.get("order", index + 1) or index + 1) >= condition_order and depth <= loop_depth:
+            depth = loop_depth + 1
+        lines.append("    " * max(0, depth - 1) + raw)
+    return "\n".join(line for line in lines if line.strip())
+
+
+def build_screenshot_hard_constraints(
+    screenshot_analysis,
+    ocr_text: str,
+    student_question: str = "",
+):
+    """逐段分析全部脚本，综合关系后，输出与本轮问题最相关的高置信度诊断。"""
+    structure = get_screenshot_structure(screenshot_analysis)
+    intent = classify_student_debug_intent(student_question)
+    question_goal = infer_question_goal(student_question)
+    explicit_unrelated_goal = bool(
+        question_goal.get("actions")
+        and not any(action in {"切换受击造型", "改变分数"} for action in question_goal.get("actions", []))
+    )
+    hit_scripts = find_relevant_hit_scripts(structure)
+    boolean_wait_errors = find_boolean_wait_errors(structure)
+    parallel_conflicts = find_parallel_modification_conflicts(structure)
+
+    evidence = []
+    for item in hit_scripts:
+        script = item["script"]
+        evidence.append(
+            f"{script.get('id')}含鼠标与碰撞条件；条件在循环中={item['condition_inside_loop']}；脚本含循环={item['has_loop']}"
+        )
+    for item in boolean_wait_errors:
+        evidence.append(f"{item['script'].get('id')}把布尔条件放入等待秒数输入框")
+    for prop, scripts in parallel_conflicts.items():
+        evidence.append(f"{len(scripts)}段持续脚本同时修改{prop}")
+
+    direct_answer = ""
+    primary_hit = hit_scripts[0] if hit_scripts else None
+
+    # 击中反馈、加分或只运行一次：相关条件没有位于持续循环中。
+    if intent in {"hit_feedback_missing", "score_not_increasing", "runs_once"} and primary_hit and not primary_hit["condition_inside_loop"]:
+        script = primary_hit["script"]
+        program = build_missing_loop_repair(structure, script)
+        event = get_event_text(script) or "这个事件"
+        if intent == "hit_feedback_missing":
+            reason = f"“{event}”触发后，这个条件只判断一次，所以之后再击中目标时不会重新检查。"
+            verification = "改好后再击中一次，看看造型会不会变化。"
+        elif intent == "score_not_increasing":
+            reason = f"“{event}”触发后，这个条件只判断一次，所以之后再击中目标时不会重新检查加分条件。"
+            verification = "改好后再击中一次，看看分数会不会增加。"
+        else:
+            reason = "这段条件只判断一次，所以后续操作不会继续触发。"
+            verification = "改好后运行一下，看看程序是否会持续判断。"
+        if program:
+            direct_answer = f"{reason}\n\n正确修改：\n[[PROGRAM]]\n{program}\n[[/PROGRAM]]\n{verification}"
+
+    # 闪现或一般截图诊断：布尔条件被放进数值等待槽。
+    elif boolean_wait_errors and not explicit_unrelated_goal:
+        err = boolean_wait_errors[0]
+        program = build_boolean_wait_repair(structure, err["script"], err["block"], student_question)
+        if program:
+            condition_text = extract_boolean_input_text(err["block"])
+            direct_answer = (
+                f"“{condition_text}”被放进了“等待（）秒”的数值框，等待积木这里应该填写时间。"
+                "把这个条件移到“如果……那么……”中，并把等待改成数值等待。\n\n"
+                f"正确修改：\n[[PROGRAM]]\n{program}\n[[/PROGRAM]]\n"
+                "改好后运行一下，看看效果是否正常。"
+            )
+
+    elif intent == "flicker" and "costume" in parallel_conflicts:
+        direct_answer = (
+            "截图中有两段以上的持续脚本同时修改同一个角色的造型，后执行的造型会覆盖前一段，所以看起来会不停闪。"
+            "先把与当前反馈有关的造型切换集中到一段脚本中，再运行观察效果。"
+        )
+
+    constraints = {
+        "intent": intent,
+        "current_object": structure.get("current_object", ""),
+        "script_count": structure.get("script_count", 0),
+        "all_scripts_analyzed": True,
+        "evidence": evidence,
+        "uncertainties": structure.get("uncertainties", []),
+        "rules": [
+            "必须先逐段分析所有可见脚本，再综合脚本之间的关系。",
+            "必须以学生本轮问题为主，选择与该现象关系最直接的原因。",
+            "程序框中的已有积木必须逐字复制截图结构中的text，不得重新命名。",
+            "不能机械保留明显错误的动作顺序；必须结合学生问题和动作语义判断反馈动作与恢复动作。",
+            "只允许新增解决当前错误必需的积木；新增积木优先沿用同一截图中的平台术语。",
+            "不得把其他脚本中存在的循环误认为当前条件已经位于循环中。",
+            "不得无依据增加停止其他脚本、状态变量或复杂控制方案。",
+        ],
+    }
+    return json.dumps(constraints, ensure_ascii=False), direct_answer
+
+
+# =========================
+# 4.5.1 连续截图调试上下文
+# =========================
+
+def _compact_text(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def extract_structure_entities(structure: dict) -> dict:
+    """从截图结构中提取可用于新旧截图关系判断的稳定实体。"""
+    entities = {
+        "object": str(structure.get("current_object", "") or "").strip(),
+        "events": set(),
+        "messages": set(),
+        "costumes": set(),
+        "variables": set(),
+        "targets": set(),
+        "block_terms": set(),
+    }
+    for script in structure.get("scripts", []):
+        event = str(script.get("event", "") or "").strip()
+        if event:
+            entities["events"].add(event)
+        for block in script.get("blocks", []):
+            text = str(block.get("text", "") or "").strip()
+            if not text:
+                continue
+            compact = _compact_text(text)
+            entities["block_terms"].add(compact)
+            for pattern, key in [
+                (r"(?:广播|当接收到)\s*[“\"']?(.+?)[”\"']?(?:$|并等待|$)", "messages"),
+                (r"换成\s*[“\"']?(.+?)[”\"']?\s*造型", "costumes"),
+                (r"碰到\s*[“\"']?(.+?)[”\"']?\s*\?", "targets"),
+                (r"(?:将|把)\s*[“\"']?(.+?)[”\"']?\s*(?:设为|增加|改变)", "variables"),
+            ]:
+                match = re.search(pattern, text)
+                if match:
+                    entities[key].add(match.group(1).strip())
+    return entities
+
+
+def structure_summary_for_prompt(structure: dict, max_scripts: int = 12) -> str:
+    """生成可安全传给回答模型的截图结构摘要。"""
+    lines = [
+        f"当前对象：{structure.get('current_object', '') or '未确认'}",
+        f"可见脚本数：{structure.get('script_count', 0)}",
+    ]
+    for index, script in enumerate(structure.get("scripts", [])[:max_scripts], start=1):
+        lines.append(f"脚本{index}：")
+        for block in script.get("blocks", []):
+            raw = str(block.get("text", "") or "").strip()
+            if not raw:
+                continue
+            depth = max(0, int(block.get("nesting_depth", 0) or 0))
+            lines.append("  " * depth + raw)
+    uncertainties = structure.get("uncertainties", [])
+    if uncertainties:
+        lines.append("不确定项：" + "；".join(map(str, uncertainties[:4])))
+    return "\n".join(lines)
+
+
+def infer_question_goal(question: str) -> dict:
+    """从学生原话中提取触发方式和期望动作，避免用常见场景替代学生目标。"""
+    text = _compact_text(question)
+    trigger = ""
+    if any(k in text for k in ["点击角色", "点角色", "点击锤子", "点锤子", "鼠标点击"]):
+        trigger = "点击角色"
+    elif any(k in text for k in ["碰到", "撞到", "接触"]):
+        trigger = "碰撞"
+    elif any(k in text for k in ["按键", "空格键", "方向键", "键盘"]):
+        trigger = "按键"
+    elif any(k in text for k in ["绿旗", "开始"]):
+        trigger = "开始事件"
+
+    actions = []
+    action_map = [
+        (["左转"], "左转"), (["右转"], "右转"), (["旋转", "转动", "挥动", "摆动"], "转动"),
+        (["跟随鼠标", "移到鼠标", "鼠标指针"], "跟随鼠标"),
+        (["哭", "受伤"], "切换受击造型"), (["加分", "得分"], "改变分数"),
+        (["隐藏", "消失"], "隐藏"), (["显示", "出现"], "显示"),
+        (["播放声音", "声音"], "播放声音"),
+    ]
+    for keys, label in action_map:
+        if any(k in text for k in keys) and label not in actions:
+            actions.append(label)
+
+    return {"trigger": trigger, "actions": actions, "raw": str(question or "").strip()}
+
+
+def is_followup_or_correction(question: str) -> bool:
+    text = _compact_text(question)
+    if not text:
+        return False
+    cues = [
+        "我的意思", "我是说", "不是", "是我", "对", "不对", "还是", "继续", "刚才", "上面", "这个",
+        "它", "那里", "这样", "只要", "我想要", "我希望", "应该是", "改成",
+    ]
+    return len(text) <= 40 or any(cue in text for cue in cues)
+
+
+def is_text_related_to_context(question: str, context: dict) -> bool:
+    """判断无新截图的文字是否仍在追问最近一次截图。"""
+    if not context:
+        return False
+    if is_followup_or_correction(question):
+        return True
+    text = _compact_text(question)
+    if not text:
+        return False
+    structure = context.get("structure", {}) or {}
+    entities = extract_structure_entities(structure)
+    candidates = [entities.get("object", "")]
+    for key in ["messages", "costumes", "variables", "targets"]:
+        candidates.extend(list(entities.get(key, set()) or set()))
+    return any(_compact_text(item) and _compact_text(item) in text for item in candidates)
+
+
+def _set_overlap(a, b) -> float:
+    a = set(a or [])
+    b = set(b or [])
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(1, len(a | b))
+
+
+def compare_debug_contexts(previous: dict, new_structure: dict, new_question: str) -> dict:
+    """判断新截图是同一任务、同一作品的新任务、无关内容，还是证据不足。"""
+    if not previous:
+        return {
+            "relation": "new_context",
+            "reason": "没有可比较的上一轮截图上下文",
+            "inherit_project_context": False,
+            "inherit_debug_diagnosis": False,
+        }
+
+    prev_structure = previous.get("structure", {}) or {}
+    prev_entities = extract_structure_entities(prev_structure)
+    new_entities = extract_structure_entities(new_structure)
+    prev_obj = _compact_text(prev_entities.get("object", ""))
+    new_obj = _compact_text(new_entities.get("object", ""))
+
+    same_object = bool(prev_obj and new_obj and prev_obj == new_obj)
+    event_overlap = _set_overlap(prev_entities["events"], new_entities["events"])
+    message_overlap = _set_overlap(prev_entities["messages"], new_entities["messages"])
+    costume_overlap = _set_overlap(prev_entities["costumes"], new_entities["costumes"])
+    target_overlap = _set_overlap(prev_entities["targets"], new_entities["targets"])
+    term_overlap = _set_overlap(prev_entities["block_terms"], new_entities["block_terms"])
+    project_score = max(message_overlap, target_overlap, costume_overlap, event_overlap)
+    task_score = (0.45 if same_object else 0.0) + 0.35 * term_overlap + 0.20 * event_overlap
+
+    prev_goal = previous.get("goal", {}) or {}
+    new_goal = infer_question_goal(new_question)
+    trigger_changed = bool(prev_goal.get("trigger") and new_goal.get("trigger") and prev_goal.get("trigger") != new_goal.get("trigger"))
+    action_changed = bool(prev_goal.get("actions") and new_goal.get("actions") and set(prev_goal.get("actions", [])) != set(new_goal.get("actions", [])))
+
+    if same_object and task_score >= 0.55 and not (trigger_changed or action_changed):
+        relation = "same_task"
+        reason = "当前角色和主要脚本高度重合，且学生目标未发生明显变化"
+        inherit_debug = True
+    elif same_object or project_score >= 0.25:
+        relation = "same_project_new_task"
+        reason = "截图仍属于同一作品或共享相同消息、造型、碰撞对象，但当前角色或目标发生变化"
+        inherit_debug = False
+    elif prev_obj and new_obj and prev_obj != new_obj and project_score == 0:
+        relation = "unrelated"
+        reason = "角色和关键脚本实体均未发现可靠重合"
+        inherit_debug = False
+    else:
+        relation = "uncertain"
+        reason = "截图中的角色或关键脚本信息不足，无法可靠判断与上一轮的关系"
+        inherit_debug = False
+
+    return {
+        "relation": relation,
+        "reason": reason,
+        "inherit_project_context": relation in {"same_task", "same_project_new_task"},
+        "inherit_debug_diagnosis": inherit_debug,
+        "scores": {
+            "task": round(task_score, 3),
+            "project": round(project_score, 3),
+            "term_overlap": round(term_overlap, 3),
+        },
+    }
+
+
+def build_active_debug_context_prompt(context: dict) -> str:
+    if not context:
+        return "当前没有可继承的截图调试上下文。"
+    structure = context.get("structure", {}) or {}
+    goal = context.get("goal", {}) or {}
+    relation = context.get("relation", {}) or {}
+    return f"""
+【最近一次有效截图调试上下文】
+学生当时的问题：{context.get('question', '') or '未说明'}
+学生目标：触发方式={goal.get('trigger', '') or '未确认'}；期望动作={'、'.join(goal.get('actions', [])) or '未确认'}
+新旧截图关系：{relation.get('relation', 'unknown')}；{relation.get('reason', '')}
+截图结构摘要：
+{structure_summary_for_prompt(structure)}
+
+使用规则：
+1. 这段上下文只用于理解学生对最近截图的补充、纠正或追问。
+2. 学生当前原话优先级最高；若当前原话修正了旧目标，必须更新理解，不得坚持旧答案。
+3. 不得把旧截图中的角色、诊断或程序移植到明显不同的新任务中。
+""".strip()
+
+
+def update_project_context(old_project: dict, new_structure: dict, relation: dict) -> dict:
+    """仅合并作品层面的公共实体，不继承旧任务的具体诊断。"""
+    if relation.get("relation") not in {"same_task", "same_project_new_task"}:
+        return {"entities": extract_structure_entities(new_structure)}
+    merged = old_project.copy() if isinstance(old_project, dict) else {}
+    old_entities = merged.get("entities", {}) or {}
+    new_entities = extract_structure_entities(new_structure)
+    out = {"object": new_entities.get("object", "") or old_entities.get("object", "")}
+    for key in ["events", "messages", "costumes", "variables", "targets", "block_terms"]:
+        out[key] = set(old_entities.get(key, set())) | set(new_entities.get(key, set()))
+    return {"entities": out}
 
 
 # =========================
@@ -2180,11 +3543,27 @@ def match_video_for_sb3(sb3_file_name, video_files):
 # 5. 调用 DeepSeek
 # =========================
 
-def build_api_messages(role: str, messages: list) -> list:
+def build_api_messages(
+    role: str,
+    messages: list,
+    knowledge_context: str = "",
+    current_topic: str = "",
+) -> list:
     role_prompt = build_role_prompt(role)
+    system_content = SYSTEM_PROMPT + "\n\n" + role_prompt
+
+    # 图形化编程通用知识库只用于学生端学习支持。
+    if role == "学生端":
+        system_content += (
+            "\n\n"
+            + build_student_knowledge_prompt(
+                current_theme=current_topic,
+                knowledge_context=knowledge_context
+            )
+        )
 
     api_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + role_prompt}
+        {"role": "system", "content": system_content}
     ]
 
     for msg in messages:
@@ -2196,11 +3575,21 @@ def build_api_messages(role: str, messages: list) -> list:
     return api_messages
 
 
-def call_deepseek_full(role: str, messages: list) -> str:
+def call_deepseek_full(
+    role: str,
+    messages: list,
+    knowledge_context: str = "",
+    current_topic: str = "",
+) -> str:
     """
     非流式完整生成。教师端长回答使用这个函数，避免界面先显示半截内容。
     """
-    api_messages = build_api_messages(role, messages)
+    api_messages = build_api_messages(
+        role,
+        messages,
+        knowledge_context=knowledge_context,
+        current_topic=current_topic,
+    )
     max_tokens = 12000 if role == "教师端" else 1600
 
     response = client.chat.completions.create(
@@ -2221,13 +3610,26 @@ def call_deepseek_full(role: str, messages: list) -> str:
     return answer
 
 
-def stream_deepseek(role: str, messages: list, placeholder, scroll_holder=None) -> str:
+def stream_deepseek(
+    role: str,
+    messages: list,
+    placeholder,
+    scroll_holder=None,
+    knowledge_context: str = "",
+    current_topic: str = "",
+    max_tokens_override: int = None,
+) -> str:
     """
     学生端使用流式调用，让回答逐步出现。
     教师端建议使用 call_deepseek_full()，保证长教学设计完整显示。
     """
-    api_messages = build_api_messages(role, messages)
-    max_tokens = 1600 if role == "学生端" else 12000
+    api_messages = build_api_messages(
+        role,
+        messages,
+        knowledge_context=knowledge_context,
+        current_topic=current_topic,
+    )
+    max_tokens = max_tokens_override or (1600 if role == "学生端" else 12000)
 
     response = client.chat.completions.create(
         model="deepseek-chat",
@@ -2331,6 +3733,14 @@ if user_role == "教师端":
         st.warning("老师身份需要密码。学生请选择左侧的“学生”。")
         st.stop()
 
+    st.sidebar.divider()
+    st.sidebar.markdown("### 学生端知识库")
+    if KNOWLEDGE_LOAD_ERROR:
+        st.sidebar.warning(KNOWLEDGE_LOAD_ERROR)
+    else:
+        st.sidebar.success(f"已加载 {len(KNOWLEDGE_BASE_DF)} 条知识")
+        st.sidebar.caption("文件：scratch_knowledge.xlsx")
+
 
 # 身份切换时清空当前页面对话
 if "current_role" not in st.session_state:
@@ -2341,6 +3751,9 @@ if st.session_state.current_role != user_role:
     st.session_state.messages = []
     st.session_state.quick_prompt = ""
     st.session_state.pasted_image = None
+    st.session_state.current_debug_context = {}
+    st.session_state.project_debug_context = {}
+    st.session_state.previous_debug_contexts = []
 
 
 # 初始化聊天记录
@@ -2351,6 +3764,14 @@ if "messages" not in st.session_state:
 # 初始化学生会话标识
 if "student_session_id" not in st.session_state:
     st.session_state.student_session_id = ""
+
+# 初始化连续截图调试上下文
+if "current_debug_context" not in st.session_state:
+    st.session_state.current_debug_context = {}
+if "project_debug_context" not in st.session_state:
+    st.session_state.project_debug_context = {}
+if "previous_debug_contexts" not in st.session_state:
+    st.session_state.previous_debug_contexts = []
 
 
 # 初始化快捷问题
@@ -2393,7 +3814,7 @@ if user_role == "学生端":
     with col2:
         topic_choice = st.selectbox(
             "当前主题",
-            ["海底世界", "猫捉老鼠",  "牛顿的苹果","猜数字", "打地鼠",  "其他主题"],
+            ["海底世界", "猫捉老鼠",  "牛顿的苹果","打地鼠",  "其他主题"],
             index=0
         )
 
@@ -2421,6 +3842,9 @@ if user_role == "学生端":
             st.session_state.messages = []
             st.session_state.quick_prompt = ""
             st.session_state.pasted_image = None
+            st.session_state.current_debug_context = {}
+            st.session_state.project_debug_context = {}
+            st.session_state.previous_debug_contexts = []
 
 else:
     student_name = ""
@@ -2591,12 +4015,34 @@ if user_input is not None:
             st.warning("请先选择小组号和当前主题，再进行提问。")
             st.stop()
 
-    display_user_input = user_input if user_input else "请识别这张图片中的文字。"
-    api_user_input = user_input if user_input else "请识别这张图片中的文字，并结合小学图形化编程学习场景给出简要说明。"
+    has_text_question = bool(str(user_input or "").strip())
+    is_image_only_turn = image_for_this_turn is not None and not has_text_question
+
+    if has_text_question:
+        display_user_input = str(user_input).strip()
+        api_user_input = str(user_input).strip()
+    elif is_image_only_turn and user_role == "学生端":
+        display_user_input = "请帮我分析这张程序截图中存在哪些问题。"
+        api_user_input = (
+            "学生本轮只上传了程序截图，没有输入文字问题。"
+            "请依据截图中能够确认的程序结构，分析其中存在的问题。"
+        )
+    elif is_image_only_turn:
+        display_user_input = "请分析这张截图。"
+        api_user_input = "请结合截图内容进行分析。"
+    else:
+        display_user_input = str(user_input or "").strip()
+        api_user_input = display_user_input
     uploaded_image_name = ""
     uploaded_image_path = ""
     uploaded_image_base64 = ""
     ocr_text = ""
+    screenshot_analysis = ""
+    screenshot_hard_constraints = ""
+    image_only_direct_answer = ""
+    screenshot_relation = {}
+    active_debug_context_prompt = ""
+    current_question_goal = infer_question_goal(api_user_input)
 
     # 如果上传了图片，先保存原图，再进行 OCR 文字识别
     if image_for_this_turn is not None:
@@ -2608,24 +4054,126 @@ if user_input is not None:
         with st.spinner("正在识别图片中的文字，请稍等……"):
             ocr_text = recognize_image_text(image_for_this_turn)
 
+        # OCR只能识别文字，不能可靠判断积木嵌套和多段脚本关系。
+        # 学生端额外调用Qwen-VL提取截图结构证据，再交给DeepSeek组织教学提示。
+        if user_role == "学生端":
+            image_for_this_turn.seek(0)
+            with st.spinner("正在分析截图中的程序结构，请稍等……"):
+                screenshot_analysis = analyze_student_screenshot_with_qwen_vl(
+                    image_for_this_turn,
+                    student_question=api_user_input,
+                )
+            image_for_this_turn.seek(0)
+
+            screenshot_hard_constraints, image_only_direct_answer = build_screenshot_hard_constraints(
+                screenshot_analysis=screenshot_analysis,
+                ocr_text=ocr_text,
+                student_question=(str(user_input).strip() if has_text_question else ""),
+            )
+
+            # 判断本轮新截图与最近一次截图调试上下文的关系。
+            current_structure = get_screenshot_structure(screenshot_analysis)
+            previous_context = st.session_state.get("current_debug_context", {}) or {}
+            screenshot_relation = compare_debug_contexts(
+                previous=previous_context,
+                new_structure=current_structure,
+                new_question=(str(user_input).strip() if has_text_question else api_user_input),
+            )
+
+            # 同一作品的新任务不能继承旧诊断；同一任务可以保留作品背景，
+            # 但本轮截图和本轮问题仍然具有最高优先级。
+            if previous_context and not screenshot_relation.get("inherit_debug_diagnosis", False):
+                history = st.session_state.get("previous_debug_contexts", [])
+                history.append(previous_context)
+                st.session_state.previous_debug_contexts = history[-8:]
+
+            st.session_state.project_debug_context = update_project_context(
+                st.session_state.get("project_debug_context", {}) or {},
+                current_structure,
+                screenshot_relation,
+            )
+            st.session_state.current_debug_context = {
+                "structure": current_structure,
+                "question": (str(user_input).strip() if has_text_question else api_user_input),
+                "goal": current_question_goal,
+                "relation": screenshot_relation,
+                "ocr_text": ocr_text,
+                "hard_constraints": screenshot_hard_constraints,
+            }
+            active_debug_context_prompt = build_active_debug_context_prompt(
+                st.session_state.current_debug_context
+            )
+
         # 不把“已上传图片：xxx”重复显示在聊天文字里；
         # 图片会直接嵌入用户消息气泡中。
         api_user_input = f"""
 【本轮用户最新问题】
 {api_user_input}
 
+【本轮截图结构分析（视觉证据）】
+{screenshot_analysis or "未获得截图结构分析。"}
+
 【本轮截图文字识别结果】
 {ocr_text}
 
-请优先回答“本轮用户最新问题”，并结合“本轮截图文字识别结果”分析。
+【高置信度诊断约束】
+{screenshot_hard_constraints or "本轮无额外硬性约束。"}
+
+【学生本轮目标提取】
+触发方式：{current_question_goal.get("trigger") or "未确认"}
+期望动作：{"、".join(current_question_goal.get("actions", [])) or "未确认"}
+
+【与最近一次截图的关系】
+{screenshot_relation or {"relation": "new_context", "reason": "没有上一轮截图上下文"}}
+
+请根据“本轮用户最新问题”和截图证据作答。
 
 注意：
-1. 只围绕本轮最新问题回答，不要重复回答历史问题。
-2. 如果本轮有文字问题，必须先回应文字问题，再结合截图说明。
-3. 不要把 OCR 结果逐字全部展示给学生，除非学生明确要求“识别文字”。
-4. 如果识别结果不足以判断问题，请提醒用户上传更清晰的截图，或补充说明自己想实现什么、已经做了什么、出现了什么问题。
-5. 面向学生时，仍然不能直接给完整程序，只能给分步提示或检查方向。
+1. 只围绕本轮最新输入回答，不要重复回答历史问题。
+2. 如果本轮有文字问题，必须以文字问题为主，结合截图中与该问题直接相关的证据回答，不要另行扩展其他问题。
+3. 如果本轮只有截图、没有文字问题，默认帮助学生分析截图中的程序问题：先指出截图能够直接确认的最主要问题，并给出一个修改方向；如果截图还明确显示第二个与程序运行直接相关的问题，可以再简要指出，但不要一次罗列大量可能原因。
+4. 截图结构分析的优先级高于OCR文字和知识库；不得用常见错误替代截图中已经显示的事实。
+5. 在回答“缺少等待、缺少循环、缺少条件”等结论前，必须核对截图结构分析是否明确显示该积木已经存在。
+6. 必须先读取截图中的全部可见独立脚本，逐段分析每段脚本的事件、循环、条件和动作，再综合检查它们是否同时修改造型、显示状态、位置、方向、大小或变量。不得只分析前两段脚本。
+7. 不要向学生逐字展示OCR结果或后台截图结构分析，除非学生明确要求识别文字。
+8. 如果结构分析与OCR矛盾、截图连接关系不清、关键积木被遮挡，或无法判断学生想实现的效果，不要猜测；说明当前截图能确认的内容，并只追问一个关键问题。
+9. 截图中能够明确判断错误时，必须在简短分析后给出“修改后的关键程序”框。程序框只包含与当前问题直接相关的一段脚本，不包含整个作品。
+10. 修改方向必须告诉学生怎样修改现有程序，例如“把循环执行改成一次执行”“把等待中的条件改成固定秒数”或“把条件放入如果……那么”。不得只说“删掉脚本”“只保留另一段脚本”“重新写”。
+11. 必须优先采用“高置信度诊断约束”，不得用一般经验替换其中已确认的问题，也不得输出其中明确禁止的误判。截图没有显示“停止”积木、状态变量或暂停机制时，不得自行建议添加这些结构。
+12. 只有截图中没有任何可确认结构错误时，才询问学生想实现什么效果；不能在已有明确错误时先追问目标。
+13. 只有截图证据足以确定正确连接关系时，才使用 [[PROGRAM]] 和 [[/PROGRAM]] 展示局部程序，并按积木嵌套关系缩进。程序框中的已有积木文字必须来自截图结构分析的原始 text 字段，不得根据常识重新拼写；证据不足时不得编造程序，应只追问一个关键问题。程序框前说明原因和具体修改，程序框后鼓励学生运行验证。
+14. “为什么一直闪现”和“打到后没有哭”属于不同问题，必须分别分析；不得因为截图结构相似就复用同一回答。
+15. 截图证据充分时，回答结构为：简短说明原因；说明怎样修改；用一个局部程序框呈现正确连接顺序；鼓励学生运行验证。截图证据不足时，不得强行输出程序框。
+16. 必须先从学生原话中识别“由什么触发”和“想发生什么动作”。学生说“点击锤子时左转再右转”，就不能擅自改成“碰到地鼠时触发”。
+17. 同一作品中的新角色或新功能属于新调试任务，只能继承作品背景，不能继承上一任务的错误结论。
+18. 若学生明确补充或纠正目标，以最新原话为准；不得继续沿用模型上一轮的误解。
+19. 学生目标与截图结构不矛盾时，应直接说明需要移动、保留或新增哪些现有积木；不要引入截图和问题中没有出现的碰撞、广播、变量或停止脚本。
+20. 如果学生的目标仍有两种以上合理理解，只追问一个确认问题，不要先输出完整程序。
 """
+
+    # 没有上传新截图时，如果学生是在补充、纠正或追问最近一次截图，
+    # 继续携带最近一次有效截图结构；避免只看一句“是我控制”而脱离上下文猜测。
+    if image_for_this_turn is None and user_role == "学生端":
+        active_context = st.session_state.get("current_debug_context", {}) or {}
+        related_to_recent_screenshot = is_text_related_to_context(api_user_input, active_context)
+        if active_context and related_to_recent_screenshot:
+            active_debug_context_prompt = build_active_debug_context_prompt(active_context)
+            followup_flag = is_followup_or_correction(api_user_input)
+            api_user_input = f"""
+【学生本轮最新输入】
+{api_user_input}
+
+{active_debug_context_prompt}
+
+【本轮是否像补充或纠正】
+{followup_flag}
+
+请先结合最近截图理解学生最新输入。学生最新输入优先级最高：
+1. 若是在补充或纠正目标，先更新对目标的理解，再回答，不得重复旧结论。
+2. 若学生说“不是……”“是我控制”“我的意思是……”，必须把它理解为对最近截图任务的修正。
+3. 若本轮已经足以确定触发方式和动作，直接给出对应的局部修改；若仍有歧义，只问一个确认问题。
+4. 不得把知识库中的常见场景替代最近截图中的实际角色、事件和积木。
+""".strip()
 
     # 页面上显示用户文字和对应图片，历史消息中也保留这张图片
     st.session_state.messages.append({
@@ -2648,18 +4196,46 @@ if user_input is not None:
         try:
             # 历史记录只放“用户真实显示文字”和助手回答，避免上一轮 OCR 长文本反复干扰本轮问题。
             # 本轮如果有截图，只把本轮 OCR 拼进最后一条 user 消息。
-            messages_for_api = [
-                {
-                    "role": msg["role"],
-                    "content": msg["content"]
-                }
-                for msg in st.session_state.messages[:-1]
-            ] + [
-                {
-                    "role": "user",
-                    "content": api_user_input
-                }
-            ]
+            # 截图调试必须只依据本轮问题和本轮截图，避免上一轮错误回复继续影响本轮。
+            if image_for_this_turn is not None:
+                messages_for_api = [
+                    {
+                        "role": "user",
+                        "content": api_user_input
+                    }
+                ]
+            else:
+                messages_for_api = [
+                    {
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    }
+                    for msg in st.session_state.messages[:-1]
+                ] + [
+                    {
+                        "role": "user",
+                        "content": api_user_input
+                    }
+                ]
+
+            # 学生端根据“本轮问题 + OCR结果”检索最相关的1—3条知识。
+            knowledge_context = ""
+            if user_role == "学生端" and image_for_this_turn is None:
+                # 对最近截图的补充/纠正，优先使用截图上下文，不调用知识库，避免通用案例覆盖学生当前目标。
+                active_context = st.session_state.get("current_debug_context", {}) or {}
+                followup_to_screenshot = is_text_related_to_context(
+                    (str(user_input).strip() if has_text_question else api_user_input),
+                    active_context,
+                )
+                if not followup_to_screenshot:
+                    matched_knowledge = retrieve_knowledge(
+                        knowledge_df=KNOWLEDGE_BASE_DF,
+                        student_question=(str(user_input).strip() if has_text_question else ""),
+                        current_theme=topic,
+                        ocr_text="",
+                        top_k=3,
+                    )
+                    knowledge_context = build_knowledge_context(matched_knowledge)
 
             assistant_placeholder = st.empty()
 
@@ -2671,24 +4247,76 @@ if user_input is not None:
                     unsafe_allow_html=True
                 )
             else:
-                answer = stream_deepseek(
-                    user_role,
-                    messages_for_api,
-                    assistant_placeholder,
-                    scroll_holder
-                )
+                if image_for_this_turn is not None and image_only_direct_answer:
+                    # 对少量可由截图直接确认的高置信度结构错误，使用确定性短答，
+                    # 避免回答模型把正常的随机出现逻辑误判为错误。
+                    answer = postprocess_answer("学生端", image_only_direct_answer)
+                    assistant_placeholder.markdown(
+                        build_chat_bubble_html("assistant", answer),
+                        unsafe_allow_html=True
+                    )
+                else:
+                    answer = stream_deepseek(
+                        user_role,
+                        messages_for_api,
+                        assistant_placeholder,
+                        scroll_holder,
+                        knowledge_context=knowledge_context,
+                        current_topic=topic,
+                        max_tokens_override=(520 if image_for_this_turn is not None else None),
+                    )
+
+                # 如果截图调试回答仍把“删除整段脚本”当作首选方法，
+                # 且本轮已有高置信度的具体修改建议，则替换为具体修改建议。
+                if (
+                    user_role == "学生端"
+                    and image_for_this_turn is not None
+                    and image_only_direct_answer
+                    and any(
+                        phrase in str(answer)
+                        for phrase in [
+                            "删掉脚本", "删除脚本", "删掉这段脚本", "删除这段脚本",
+                            "只保留脚本", "只保留另一段", "重新写一遍", "重写程序"
+                        ]
+                    )
+                ):
+                    answer = postprocess_answer("学生端", image_only_direct_answer)
+                    assistant_placeholder.markdown(
+                        build_chat_bubble_html("assistant", answer),
+                        unsafe_allow_html=True
+                    )
 
             try:
                 scroll_to_bottom(scroll_holder, smooth=True)
             except Exception:
                 pass
 
+            # 纯文字追问若仍与最近截图相关，更新“当前学生目标”，但保留最近截图结构。
+            if user_role == "学生端" and image_for_this_turn is None:
+                active_context = st.session_state.get("current_debug_context", {}) or {}
+                raw_latest_question = str(user_input).strip() if has_text_question else api_user_input
+                if active_context and is_text_related_to_context(raw_latest_question, active_context):
+                    latest_goal = infer_question_goal(raw_latest_question)
+                    merged_goal = dict(active_context.get("goal", {}) or {})
+                    if latest_goal.get("trigger"):
+                        merged_goal["trigger"] = latest_goal["trigger"]
+                    if latest_goal.get("actions"):
+                        merged_goal["actions"] = latest_goal["actions"]
+                    merged_goal["raw"] = raw_latest_question
+                    active_context["goal"] = merged_goal
+                    active_context["question"] = raw_latest_question
+                    st.session_state.current_debug_context = active_context
+
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": answer
             })
 
-            log_user_input = user_input if user_input else "请识别这张图片中的文字。"
+            log_user_input = (
+                str(user_input).strip()
+                if has_text_question
+                else display_user_input
+            )
 
             if uploaded_image_name:
                 log_user_input = f"{log_user_input}（上传图片：{uploaded_image_name}）"
@@ -2703,6 +4331,7 @@ if user_input is not None:
                 uploaded_image_name=uploaded_image_name,
                 uploaded_image_path=uploaded_image_path,
                 ocr_text=ocr_text,
+                screenshot_analysis=screenshot_analysis,
                 uploaded_image_base64=uploaded_image_base64
             )
 
@@ -2929,3 +4558,4 @@ if user_role == "教师端":
         st.sidebar.divider()
         st.sidebar.markdown("### 对话记录")
         st.sidebar.info("暂无可下载的对话记录。")
+
